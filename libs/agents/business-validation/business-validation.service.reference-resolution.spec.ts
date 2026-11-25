@@ -561,7 +561,7 @@ describe('Business Logic reference resolution: ambiguity never hides a failure',
             request(
                 {
                     title: 'Add the profile',
-                    body: 'See #123 for context',
+                    body: 'Also touches #123, unrelated',
                     headRef: 'feature/x',
                 },
                 {
