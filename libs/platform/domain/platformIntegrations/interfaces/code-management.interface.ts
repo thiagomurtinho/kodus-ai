@@ -20,7 +20,9 @@ import { GitCloneParams } from '../types/codeManagement/gitCloneParams.type';
 import {
     CodeManagementIssue,
     GetIssueParams,
+    GetPullRequestLinkedIssuesParams,
     ListIssuesParams,
+    PullRequestLinkedIssues,
 } from '../types/codeManagement/issues.type';
 import { Organization } from '../types/codeManagement/organization.type';
 import {
@@ -79,6 +81,9 @@ export interface ICodeManagementService extends ICommonPlatformIntegrationServic
      */
     listIssues?(params: ListIssuesParams): Promise<CodeManagementIssue[]>;
     getIssue?(params: GetIssueParams): Promise<CodeManagementIssue | null>;
+    getPullRequestLinkedIssues?(
+        params: GetPullRequestLinkedIssuesParams,
+    ): Promise<PullRequestLinkedIssues>;
     /**
      * Optional refinement of issue support beyond "the method exists" — e.g.
      * Bitbucket implements `listIssues` but Data Center/Server has no issue

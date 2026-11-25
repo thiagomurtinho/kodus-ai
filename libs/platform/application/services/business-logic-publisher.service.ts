@@ -49,6 +49,7 @@ import { DeliveryStatus } from '@libs/platformData/domain/pullRequests/enums/del
 import type { ISuggestionByPR } from '@libs/platformData/domain/pullRequests/interfaces/pullRequests.interface';
 import { PriorityStatus } from '@libs/platformData/domain/pullRequests/enums/priorityStatus.enum';
 
+import { withPullRequestLinks } from './business-logic-pull-request-links';
 import { withRepositoryReader } from './business-logic-repository-reader';
 
 /** The PR a door acts on, so its files can pick the directory's settings. */
@@ -234,7 +235,10 @@ export class BusinessLogicPublisher {
     withRepository(
         request: BusinessValidationRequest,
     ): BusinessValidationRequest {
-        return withRepositoryReader(request, this.codeManagementService);
+        return withPullRequestLinks(
+            withRepositoryReader(request, this.codeManagementService),
+            this.codeManagementService,
+        );
     }
 
     /**

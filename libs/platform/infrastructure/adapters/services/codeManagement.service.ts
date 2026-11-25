@@ -33,7 +33,9 @@ import { GitCloneParams } from '@libs/platform/domain/platformIntegrations/types
 import {
     CodeManagementIssue,
     GetIssueParams,
+    GetPullRequestLinkedIssuesParams,
     ListIssuesParams,
+    PullRequestLinkedIssues,
 } from '@libs/platform/domain/platformIntegrations/types/codeManagement/issues.type';
 import {
     PullRequest,
@@ -170,6 +172,35 @@ export class CodeManagementService implements ICodeManagementService {
         }
 
         return codeManagementService.getIssue(params);
+    }
+
+    /**
+     * The issues the host ties to a pull request. Only GitHub has them: any
+     * other host, or a failure, answers with none.
+     */
+    async getPullRequestLinkedIssues(
+        params: GetPullRequestLinkedIssuesParams,
+        type?: PlatformType,
+    ): Promise<PullRequestLinkedIssues> {
+        const none: PullRequestLinkedIssues = {
+            closing: [],
+            crossReferencing: [],
+        };
+        try {
+            type ??= await this.getTypeIntegration(
+                extractOrganizationAndTeamData(params),
+            );
+            if (!type) {
+                return none;
+            }
+            const provider =
+                this.platformIntegrationFactory.getCodeManagementService(type);
+            return (
+                (await provider.getPullRequestLinkedIssues?.(params)) ?? none
+            );
+        } catch {
+            return none;
+        }
     }
 
     /**

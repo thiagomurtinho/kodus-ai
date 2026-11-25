@@ -1,7 +1,9 @@
 import {
     extractTaskReferences,
     referenceLabel,
+    linkedIssueReference,
     selectReferences,
+    splitReferenceSteps,
 } from './task-references';
 
 const ids = (sources: Parameters<typeof extractTaskReferences>[0]) =>
@@ -499,5 +501,75 @@ describe('the summary Kody writes into the description', () => {
             'OPS-10',
         ]);
         expect(Date.now() - started).toBeLessThan(1000);
+    });
+});
+
+describe('splitReferenceSteps', () => {
+    const steps = splitReferenceSteps(
+        extractTaskReferences({
+            command: '#5',
+            title: 'feat: profile (PAY-42)',
+            branch: 'work-341/kodus-profile',
+            body: 'Refs org/repo#341. Follow-up to PAY-12. Closes #77.',
+        }),
+    );
+    const ids = (refs: Array<{ id: string }>) => refs.map((r) => r.id);
+
+    it('keeps the command, the title, what the description names, the branch and its mentions apart', () => {
+        expect(ids(steps.command)).toEqual(['5']);
+        expect(ids(steps.title)).toEqual(['PAY-42']);
+        expect(ids(steps.body)).toEqual(['341', '77']);
+        expect(ids(steps.branch)).toEqual(['WORK-341']);
+        expect(ids(steps.mentions)).toEqual(['PAY-12']);
+    });
+
+    it('treats a cited or stated body reference as named, and a bare mention as not', () => {
+        const { body, mentions } = splitReferenceSteps(
+            extractTaskReferences({
+                body: 'Part of PAY-3\nSee PAY-4\nRelated: PAY-5 and https://acme.atlassian.net/browse/PAY-6',
+            }),
+        );
+        expect(ids(body)).toEqual(['PAY-3', 'PAY-4']);
+        expect(ids(mentions)).toEqual(['PAY-5', 'PAY-6']);
+    });
+
+    it('leaves a key the branch carries out of the description step, so it cannot hide a cited issue', () => {
+        const refs = extractTaskReferences({
+            branch: 'work-341/kodus-profile',
+            body: 'Refs org/repo#341',
+        });
+        // The whole-PR rule: the stated branch key wins over the body citation.
+        expect(selectReferences(refs, 3)?.map((r) => r.id)).toEqual([
+            'WORK-341',
+        ]);
+        const { body } = splitReferenceSteps(refs);
+        expect(selectReferences(body, 3)?.map((r) => r.id)).toEqual(['341']);
+    });
+});
+
+describe('linkedIssueReference', () => {
+    it('names an issue GitHub links as a stated reference of its own source', () => {
+        expect(linkedIssueReference({ number: 341 })).toEqual({
+            kind: 'git_issue',
+            id: '341',
+            raw: '#341',
+            source: 'link',
+            intent: 'closes',
+        });
+        expect(
+            selectReferences([linkedIssueReference({ number: 341 })], 3),
+        ).toHaveLength(1);
+    });
+
+    it('keeps the repository of an issue that is not the PR own', () => {
+        expect(
+            linkedIssueReference({
+                number: 3,
+                repository: { owner: 'acme', name: 'specs' },
+            }),
+        ).toMatchObject({
+            raw: 'acme/specs#3',
+            repository: { owner: 'acme', name: 'specs' },
+        });
     });
 });

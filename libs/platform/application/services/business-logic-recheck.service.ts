@@ -110,6 +110,17 @@ export class BusinessLogicRecheckService {
         if (!pr || (pr.state && !/open/i.test(pr.state))) {
             return false;
         }
+        // The owner is not stored with the run: the PR's base repository names
+        // it, so `#12` reads this repository's issue and the host's links to
+        // the PR can be asked for, as in the review.
+        const fullName = pr.base?.repo?.fullName;
+        const owner = fullName?.includes('/')
+            ? fullName.split('/')[0]
+            : undefined;
+        const fullRepository = {
+            ...repository,
+            ...(owner ? { owner, fullName } : {}),
+        };
 
         // As the review would: the PR's directory settings and model, and
         // nothing at all once the team turned Business Logic off or the
@@ -135,7 +146,7 @@ export class BusinessLogicRecheckService {
         const request: BusinessValidationRequest = {
             door: 'auto',
             organizationAndTeamData,
-            repository,
+            repository: fullRepository,
             byokModel: config.byokModel,
             byokModelId: config.byokModelId,
             pullRequest: {
