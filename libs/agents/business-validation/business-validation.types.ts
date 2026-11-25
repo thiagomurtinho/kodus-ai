@@ -219,6 +219,12 @@ export type TaskResolution =
 /** Which entry point asked for the validation. */
 export type ValidationDoor = 'auto' | 'force' | 'command' | 'cli';
 
+/** An issue named by number; `repository` when it is not the PR's own. */
+export interface LinkedIssue {
+    number: number;
+    repository?: { owner: string; name: string };
+}
+
 export interface BusinessValidationRequest {
     door: ValidationDoor;
     organizationAndTeamData: OrganizationAndTeamData;
@@ -238,6 +244,16 @@ export interface BusinessValidationRequest {
         authorIsBot?: boolean;
     };
     platformType?: string;
+    /**
+     * Lazy lookups of the issues the host ties to the PR: the ones linked in
+     * its Development sidebar or by a closing keyword, and the issues of the
+     * repository that mention it. Each is called only when a resolution step
+     * needs it. Absent where the host has no such links (the CLI's local diff).
+     */
+    pullRequestLinks?: {
+        closingIssues(): Promise<LinkedIssue[]>;
+        crossReferencingIssues(): Promise<LinkedIssue[]>;
+    };
     /**
      * The repository at the PR head, read-only, so a requirement the diff
      * doesn't show can be looked for in the code that already exists. Absent

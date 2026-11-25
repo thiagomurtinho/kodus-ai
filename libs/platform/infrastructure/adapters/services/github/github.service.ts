@@ -109,7 +109,10 @@ import { IGithubService } from '@libs/platform/domain/github/contracts/github.se
 import {
     CodeManagementIssue,
     GetIssueParams,
+    GetPullRequestLinkedIssuesParams,
+    LinkedIssueRef,
     ListIssuesParams,
+    PullRequestLinkedIssues,
 } from '@libs/platform/domain/platformIntegrations/types/codeManagement/issues.type';
 import {
     CheckAnnotation,
@@ -3756,6 +3759,113 @@ export class GithubService
                 return null;
             }
             throw error;
+        }
+    }
+
+    /**
+     * The issues GitHub ties to a pull request: the ones linked in its
+     * Development sidebar or by a closing keyword (`closingIssuesReferences`),
+     * and the issues of the same repository that mention it (a cross-reference
+     * event whose source is an issue). Never throws: a failure, or a missing
+     * permission, answers with none.
+     */
+    async getPullRequestLinkedIssues(
+        params: GetPullRequestLinkedIssuesParams,
+    ): Promise<PullRequestLinkedIssues> {
+        const { organizationAndTeamData, repository, prNumber } = params;
+        const none: PullRequestLinkedIssues = {
+            closing: [],
+            crossReferencing: [],
+        };
+        const query = `
+            query ($owner: String!, $name: String!, $number: Int!) {
+                repository(owner: $owner, name: $name) {
+                    pullRequest(number: $number) {
+                        closingIssuesReferences(first: 10) {
+                            nodes { number repository { nameWithOwner } }
+                        }
+                        timelineItems(first: 50, itemTypes: [CROSS_REFERENCED_EVENT]) {
+                            nodes {
+                                ... on CrossReferencedEvent {
+                                    isCrossRepository
+                                    source {
+                                        __typename
+                                        ... on Issue { number repository { nameWithOwner } }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        `;
+        try {
+            const graphql = await this.instanceGraphQL(organizationAndTeamData);
+            const response: any = await graphql(query, {
+                owner: repository.owner,
+                name: repository.name,
+                number: prNumber,
+            });
+            const pullRequest = response?.repository?.pullRequest;
+            const own = `${repository.owner}/${repository.name}`.toLowerCase();
+            const refOf = (node: any): LinkedIssueRef | undefined => {
+                const number = node?.number;
+                if (!Number.isInteger(number) || number < 1) {
+                    return undefined;
+                }
+                const full = node?.repository?.nameWithOwner as
+                    string | undefined;
+                if (!full || full.toLowerCase() === own) {
+                    return { number };
+                }
+                const [owner, name] = full.split('/');
+                return owner && name
+                    ? { number, repository: { owner, name } }
+                    : undefined;
+            };
+            const unique = (refs: Array<LinkedIssueRef | undefined>) => {
+                const seen = new Set<string>();
+                return refs.filter((r): r is LinkedIssueRef => {
+                    const key = `${r?.repository?.owner ?? ''}/${r?.repository?.name ?? ''}#${r?.number}`;
+                    if (!r || seen.has(key)) {
+                        return false;
+                    }
+                    seen.add(key);
+                    return true;
+                });
+            };
+            return {
+                closing: unique(
+                    (pullRequest?.closingIssuesReferences?.nodes ?? []).map(
+                        refOf,
+                    ),
+                ),
+                crossReferencing: unique(
+                    (pullRequest?.timelineItems?.nodes ?? [])
+                        .filter(
+                            (event: any) =>
+                                event?.isCrossRepository === false &&
+                                event?.source?.__typename === 'Issue',
+                        )
+                        .map((event: any) => refOf(event.source))
+                        .filter(
+                            (ref: LinkedIssueRef | undefined) =>
+                                !ref?.repository,
+                        ),
+                ),
+            };
+        } catch (error) {
+            this.logger.warn({
+                message: 'Could not read the issues linked to a pull request',
+                context: GithubService.name,
+                error,
+                metadata: {
+                    organizationId: organizationAndTeamData?.organizationId,
+                    repository: `${repository.owner}/${repository.name}`,
+                    prNumber,
+                },
+            });
+            return none;
         }
     }
 

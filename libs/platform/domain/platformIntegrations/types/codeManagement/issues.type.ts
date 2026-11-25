@@ -66,6 +66,26 @@ export type GetIssueParams = {
     includeArtifacts?: boolean;
 };
 
+/** An issue of a repository, named by number; `repository` when it is not the PR's own. */
+export type LinkedIssueRef = {
+    number: number;
+    repository?: { owner: string; name: string };
+};
+
+export type GetPullRequestLinkedIssuesParams = {
+    organizationAndTeamData: OrganizationAndTeamData;
+    repository: { owner: string; name: string };
+    prNumber: number;
+};
+
+/** The issues the host itself ties to a pull request (GitHub). */
+export type PullRequestLinkedIssues = {
+    /** Linked in the Development sidebar or by a closing keyword. */
+    closing: LinkedIssueRef[];
+    /** Issues of the same repository that mention the pull request. */
+    crossReferencing: LinkedIssueRef[];
+};
+
 export type GitHubIssue = {
     id: number;
     nodeId: string;
