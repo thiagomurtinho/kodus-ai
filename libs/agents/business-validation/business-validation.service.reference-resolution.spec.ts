@@ -119,6 +119,7 @@ function request(
 ) {
     return {
         door: 'auto',
+        platformType: 'GITHUB',
         organizationAndTeamData: { organizationId: 'org-1', teamId: 'team-1' },
         repository: REPOSITORY,
         pullRequest: { number: 342, ...pullRequest },
@@ -609,5 +610,108 @@ describe('Business Logic reference resolution: a cut-short list of mentions', ()
             ),
         );
         expect(found).toEqual({ kind: 'found', ids: ['#12'] });
+    });
+});
+
+describe('Business Logic reference resolution: what the message says', () => {
+    const none = (extra: Record<string, unknown>) =>
+        request(
+            {
+                title: 'Add the profile',
+                body: 'Adds the page.',
+                headRef: 'feature/x',
+            },
+            extra,
+        );
+
+    it.each([['GITLAB'], ['BITBUCKET'], ['AZURE_REPOS']])(
+        'does not point a %s user to a Development sidebar',
+        async (platformType) => {
+            const { tracker } = gitIssues(titles);
+            const none404 = await told(
+                setup([tracker]),
+                none({ platformType, pullRequestLinks: links() }),
+            );
+            expect(none404.message).not.toContain('Development');
+            expect(none404.message).toContain('@kody -v business-logic');
+            const ambiguous = await told(
+                setup([gitIssues(titles).tracker]),
+                none({
+                    platformType,
+                    pullRequestLinks: links(
+                        [],
+                        [{ number: 12 }, { number: 14 }],
+                    ),
+                }),
+            );
+            expect(ambiguous.message).not.toContain('Development');
+            expect(ambiguous.message).toContain('#12');
+            expect(ambiguous.message).toContain('@kody -v business-logic');
+        },
+    );
+
+    it('does not translate the ambiguous message for a door that does not answer the author', async () => {
+        const translate = jest.fn(async (message: string) => `T:${message}`);
+        const service = setup([gitIssues(titles).tracker]);
+        (service as any).lazyJudge.mockReturnValue(async () => ({
+            translate,
+            modelSlot: {},
+        }));
+        const outcome = (
+            await (service as any).run(
+                request(
+                    {
+                        title: 'Add the profile',
+                        body: 'Adds the page.',
+                        headRef: 'feature/x',
+                    },
+                    {
+                        settings: resolveBusinessLogicSettings({
+                            requireTask: false,
+                        }),
+                        pullRequestLinks: links(
+                            [],
+                            [{ number: 12 }, { number: 14 }],
+                        ),
+                    },
+                ),
+            )
+        ).outcome;
+        expect(outcome.kind).toBe('skipped');
+        expect(outcome.message).toContain('#12');
+        expect(outcome.message).not.toMatch(/^T:/);
+        expect(translate).not.toHaveBeenCalled();
+    });
+
+    it('translates it for a door that answers', async () => {
+        const translate = jest.fn(async (message: string) => `T:${message}`);
+        const service = setup([gitIssues(titles).tracker]);
+        (service as any).lazyJudge.mockReturnValue(async () => ({
+            translate,
+            modelSlot: {},
+        }));
+        const outcome = (
+            await (service as any).run(
+                request(
+                    {
+                        title: 'Add the profile',
+                        body: 'Adds the page.',
+                        headRef: 'feature/x',
+                    },
+                    {
+                        door: 'command',
+                        settings: resolveBusinessLogicSettings({
+                            requireTask: false,
+                        }),
+                        pullRequestLinks: links(
+                            [],
+                            [{ number: 12 }, { number: 14 }],
+                        ),
+                    },
+                ),
+            )
+        ).outcome;
+        expect(outcome.message).toMatch(/^T:/);
+        expect(translate).toHaveBeenCalledTimes(1);
     });
 });

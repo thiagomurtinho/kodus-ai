@@ -57,23 +57,30 @@ This pull request doesn't reference a task. Reference it in the title, descripti
 const REFERENCE_A_TASK = `Reference the task in the title, description or branch (\`PROJ-123\`, \`Closes #123\` or a link) and comment ${RERUN}.`;
 
 /** Several issues mention the PR and nothing says which one it delivers. */
-export function ambiguousIssueMessage(candidates: string[]): string {
+export function ambiguousIssueMessage(
+    candidates: string[],
+    /** The host has a Development sidebar to link an issue in (GitHub). */
+    github = false,
+): string {
     return `## 🤔 Which issue is this?
 
 I found more than one issue that mentions this pull request: ${candidates.join(', ')}. I won't guess which one it delivers.
 
 ### 💡 Next step
-Link the right issue under **Development** in the PR's sidebar, or comment ${RERUN} followed by the issue number (for example \`${candidates[0]}\`).`;
+${github ? "Link the right issue under **Development** in the PR's sidebar, or comment" : 'Reference the right issue in the PR, or comment'} ${RERUN} followed by the issue number (for example \`${candidates[0]}\`).`;
 }
 
 /** No task referenced, and the repository's settings ask for one. */
-export function taskRequiredMessage(): string {
+export function taskRequiredMessage(
+    /** The host has a Development sidebar to link an issue in (GitHub). */
+    github = false,
+): string {
     return `## 🤔 Which task is this?
 
 This pull request doesn't reference a task, and this repository asks for one so Kody can check the PR against it.
 
 ### 💡 Next step
-${REFERENCE_A_TASK} Or link the issue under **Development** in the PR's sidebar, or comment ${RERUN} followed by the issue number.`;
+${REFERENCE_A_TASK} Or ${github ? "link the issue under **Development** in the PR's sidebar, or comment" : 'reference the issue in the PR, or comment'} ${RERUN} followed by the issue number.`;
 }
 
 export function noTrackerMessage(

@@ -550,6 +550,7 @@ export class BusinessValidationService {
             message: this.answers(request) ? await translate(message) : message,
         });
 
+        const github = String(request.platformType).toUpperCase() === 'GITHUB';
         // A bot's PR (a dependency bump) has no task to name.
         const askForTask =
             settings.requireTask && !request.pullRequest?.authorIsBot;
@@ -557,18 +558,22 @@ export class BusinessValidationService {
             case 'no_reference':
                 if (resolution.candidates?.length) {
                     // Several issues mention the PR: none is picked for the author.
-                    const message = await translate(
-                        messages.ambiguousIssueMessage(resolution.candidates),
+                    const message = messages.ambiguousIssueMessage(
+                        resolution.candidates,
+                        github,
                     );
                     return askForTask
-                        ? { kind: 'task_required', message }
+                        ? {
+                              kind: 'task_required',
+                              message: await translate(message),
+                          }
                         : skip('no_reference', message);
                 }
                 return askForTask
                     ? {
                           kind: 'task_required',
                           message: await translate(
-                              messages.taskRequiredMessage(),
+                              messages.taskRequiredMessage(github),
                           ),
                       }
                     : skip('no_reference', messages.noReferenceMessage());
