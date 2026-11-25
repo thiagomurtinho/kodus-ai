@@ -84,10 +84,15 @@ function jira(titles: Record<string, string>) {
     };
 }
 
-function links(closing: IssueRef[] = [], crossReferencing: IssueRef[] = []) {
+function links(
+    closing: IssueRef[] = [],
+    crossReferencing: IssueRef[] = [],
+    truncated = false,
+) {
     return {
         closingIssues: jest.fn(async () => closing),
         crossReferencingIssues: jest.fn(async () => crossReferencing),
+        crossReferencingTruncated: jest.fn(async () => truncated),
     };
 }
 
@@ -568,5 +573,41 @@ describe('Business Logic reference resolution: ambiguity never hides a failure',
         );
         expect(outcome.message).toContain('#12');
         expect(outcome.message).toContain('#14');
+    });
+});
+
+describe('Business Logic reference resolution: a cut-short list of mentions', () => {
+    it('does not pick the only issue it saw when the host listed just a page of them', async () => {
+        const { tracker, reads } = gitIssues(titles);
+        const outcome = await told(
+            setup([tracker]),
+            request(
+                {
+                    title: 'Add the profile',
+                    body: 'Adds the page.',
+                    headRef: 'feature/x',
+                },
+                { pullRequestLinks: links([], [{ number: 12 }], true) },
+            ),
+        );
+        expect(reads).toEqual([]);
+        expect(outcome.kind).toBe('task_required');
+        expect(outcome.message).toContain('#12');
+    });
+
+    it('still picks the one issue when the list is complete', async () => {
+        const { tracker } = gitIssues(titles);
+        const found = await resolved(
+            setup([tracker]),
+            request(
+                {
+                    title: 'Add the profile',
+                    body: 'Adds the page.',
+                    headRef: 'feature/x',
+                },
+                { pullRequestLinks: links([], [{ number: 12 }], false) },
+            ),
+        );
+        expect(found).toEqual({ kind: 'found', ids: ['#12'] });
     });
 });

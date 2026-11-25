@@ -84,6 +84,8 @@ export type PullRequestLinkedIssues = {
     closing: LinkedIssueRef[];
     /** Issues of the same repository that mention the pull request. */
     crossReferencing: LinkedIssueRef[];
+    /** The host listed only part of the mentions: none may be picked alone. */
+    crossReferencingTruncated?: boolean;
 };
 
 export type GitHubIssue = {

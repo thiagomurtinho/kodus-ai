@@ -453,8 +453,14 @@ export class BusinessValidationService {
         // nothing the author wrote read as a task, and used only when there
         // is exactly one.
         const mentioning = await linked(links?.crossReferencingIssues);
+        // A list the host cut short can't prove there is only one.
+        const truncated = mentioning.length
+            ? await Promise.resolve(links?.crossReferencingTruncated?.()).catch(
+                  () => false,
+              )
+            : false;
         const byMention =
-            mentioning.length === 1
+            mentioning.length === 1 && !truncated
                 ? await attempt(mentioning.map(linkedIssueReference))
                 : undefined;
         if (byMention) {
@@ -475,7 +481,7 @@ export class BusinessValidationService {
         // The author is asked to choose only when nothing else went wrong:
         // a tracker that was down, or a release, keeps its own answer.
         if (
-            mentioning.length > 1 &&
+            (mentioning.length > 1 || (truncated && mentioning.length)) &&
             failures.every((f) => f.resolution.kind === 'no_reference')
         ) {
             return {

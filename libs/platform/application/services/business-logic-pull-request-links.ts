@@ -47,6 +47,8 @@ export function withPullRequestLinks(
                 (await read()).closing,
             crossReferencingIssues: async (): Promise<LinkedIssue[]> =>
                 (await read()).crossReferencing,
+            crossReferencingTruncated: async (): Promise<boolean> =>
+                !!(await read()).crossReferencingTruncated,
         },
     };
 }

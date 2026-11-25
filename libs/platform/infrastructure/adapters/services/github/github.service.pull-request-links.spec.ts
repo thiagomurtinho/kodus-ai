@@ -42,12 +42,15 @@ describe('GithubService.getPullRequestLinkedIssues', () => {
                         },
                     ],
                 },
+                createdAt: '2026-11-10T00:00:00Z',
                 timelineItems: {
                     nodes: [
                         {
                             isCrossRepository: false,
                             source: {
                                 __typename: 'Issue',
+                                state: 'OPEN',
+                                createdAt: '2026-11-01T00:00:00Z',
                                 number: 7,
                                 repository: { nameWithOwner: 'acme/web' },
                             },
@@ -60,6 +63,8 @@ describe('GithubService.getPullRequestLinkedIssues', () => {
                             isCrossRepository: true,
                             source: {
                                 __typename: 'Issue',
+                                state: 'OPEN',
+                                createdAt: '2026-11-01T00:00:00Z',
                                 number: 5,
                                 repository: { nameWithOwner: 'other/repo' },
                             },
@@ -68,6 +73,8 @@ describe('GithubService.getPullRequestLinkedIssues', () => {
                             isCrossRepository: false,
                             source: {
                                 __typename: 'Issue',
+                                state: 'OPEN',
+                                createdAt: '2026-11-01T00:00:00Z',
                                 number: 7,
                                 repository: { nameWithOwner: 'acme/web' },
                             },
@@ -180,12 +187,15 @@ describe('GithubService.getPullRequestLinkedIssues', () => {
                 throw new Error('502 Bad Gateway');
             }
             return pullRequest({
+                createdAt: '2026-11-10T00:00:00Z',
                 timelineItems: {
                     nodes: [
                         {
                             isCrossRepository: false,
                             source: {
                                 __typename: 'Issue',
+                                state: 'OPEN',
+                                createdAt: '2026-11-01T00:00:00Z',
                                 number: 8,
                                 repository: { nameWithOwner: 'acme/web' },
                             },
@@ -200,5 +210,63 @@ describe('GithubService.getPullRequestLinkedIssues', () => {
         await expect(
             service.getPullRequestLinkedIssues(params),
         ).resolves.toEqual({ closing: [], crossReferencing: [{ number: 8 }] });
+    });
+
+    const mention = (number: number, state: string, createdAt: string) => ({
+        isCrossRepository: false,
+        source: {
+            __typename: 'Issue',
+            number,
+            state,
+            createdAt,
+            repository: { nameWithOwner: 'acme/web' },
+        },
+    });
+
+    it('counts only open issues that were there before the pull request', async () => {
+        const { service } = serviceWith(() =>
+            pullRequest({
+                createdAt: '2026-11-10T00:00:00Z',
+                timelineItems: {
+                    pageInfo: { hasNextPage: false },
+                    nodes: [
+                        mention(1, 'OPEN', '2026-11-01T00:00:00Z'),
+                        mention(2, 'CLOSED', '2026-11-01T00:00:00Z'),
+                        mention(3, 'OPEN', '2026-11-11T00:00:00Z'),
+                        mention(4, 'OPEN', 'not a date'),
+                    ],
+                },
+            }),
+        );
+        const result = await service.getPullRequestLinkedIssues(params);
+        expect(result.crossReferencing).toEqual([{ number: 1 }]);
+        expect(result.crossReferencingTruncated).toBeUndefined();
+    });
+
+    it('says the mentions are cut short when the timeline has another page', async () => {
+        const { service } = serviceWith(() =>
+            pullRequest({
+                createdAt: '2026-11-10T00:00:00Z',
+                timelineItems: {
+                    pageInfo: { hasNextPage: true },
+                    nodes: [mention(1, 'OPEN', '2026-11-01T00:00:00Z')],
+                },
+            }),
+        );
+        const result = await service.getPullRequestLinkedIssues(params);
+        expect(result.crossReferencing).toEqual([{ number: 1 }]);
+        expect(result.crossReferencingTruncated).toBe(true);
+    });
+
+    it('counts none without the date of the pull request', async () => {
+        const { service } = serviceWith(() =>
+            pullRequest({
+                timelineItems: {
+                    nodes: [mention(1, 'OPEN', '2026-11-01T00:00:00Z')],
+                },
+            }),
+        );
+        const result = await service.getPullRequestLinkedIssues(params);
+        expect(result.crossReferencing).toEqual([]);
     });
 });

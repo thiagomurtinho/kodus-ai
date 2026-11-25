@@ -3857,13 +3857,15 @@ export class GithubService
                 `query ($owner: String!, $name: String!, $number: Int!) {
                     repository(owner: $owner, name: $name) {
                         pullRequest(number: $number) {
+                            createdAt
                             timelineItems(first: 50, itemTypes: [CROSS_REFERENCED_EVENT]) {
+                                pageInfo { hasNextPage }
                                 nodes {
                                     ... on CrossReferencedEvent {
                                         isCrossRepository
                                         source {
                                             __typename
-                                            ... on Issue { number repository { nameWithOwner } }
+                                            ... on Issue { number state createdAt repository { nameWithOwner } }
                                         }
                                     }
                                 }
@@ -3873,6 +3875,13 @@ export class GithubService
                 }`,
             ),
         ]);
+        // An issue that mentions the PR counts only if it was open and already
+        // there when the PR was: one opened later is about the PR, not the
+        // work it delivers.
+        const openedAt = Date.parse(timeline?.createdAt);
+        const wasBefore = (createdAt: unknown) =>
+            Number.isFinite(openedAt) &&
+            Date.parse(createdAt as string) < openedAt;
         return {
             closing: unique(
                 (closing?.closingIssuesReferences?.nodes ?? []).map(refOf),
@@ -3882,13 +3891,19 @@ export class GithubService
                     .filter(
                         (event: any) =>
                             event?.isCrossRepository === false &&
-                            event?.source?.__typename === 'Issue',
+                            event?.source?.__typename === 'Issue' &&
+                            event.source.state === 'OPEN' &&
+                            wasBefore(event.source.createdAt),
                     )
                     .map((event: any) => refOf(event.source))
                     .filter(
                         (ref: LinkedIssueRef | undefined) => !ref?.repository,
                     ),
             ),
+            // Past the first page there may be more: nothing is auto-picked.
+            ...(timeline?.timelineItems?.pageInfo?.hasNextPage
+                ? { crossReferencingTruncated: true }
+                : {}),
         };
     }
 

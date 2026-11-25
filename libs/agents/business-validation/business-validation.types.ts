@@ -258,6 +258,8 @@ export interface BusinessValidationRequest {
     pullRequestLinks?: {
         closingIssues(): Promise<LinkedIssue[]>;
         crossReferencingIssues(): Promise<LinkedIssue[]>;
+        /** The host listed only part of the mentions: none may be picked alone. */
+        crossReferencingTruncated?(): Promise<boolean>;
     };
     /**
      * The repository at the PR head, read-only, so a requirement the diff

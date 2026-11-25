@@ -17,6 +17,7 @@ describe('withPullRequestLinks', () => {
             getPullRequestLinkedIssues: jest.fn(async () => ({
                 closing: [{ number: 7 }],
                 crossReferencing: [{ number: 8 }],
+                crossReferencingTruncated: true,
             })),
         };
         const wrapped = withPullRequestLinks(request(), code as any);
@@ -27,6 +28,9 @@ describe('withPullRequestLinks', () => {
         expect(
             await wrapped.pullRequestLinks!.crossReferencingIssues(),
         ).toEqual([{ number: 8 }]);
+        expect(
+            await wrapped.pullRequestLinks!.crossReferencingTruncated!(),
+        ).toBe(true);
         expect(code.getPullRequestLinkedIssues).toHaveBeenCalledTimes(1);
         expect(code.getPullRequestLinkedIssues).toHaveBeenCalledWith(
             expect.objectContaining({
