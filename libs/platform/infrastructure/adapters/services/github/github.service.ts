@@ -3710,7 +3710,12 @@ export class GithubService
     async getIssue(
         params: GetIssueParams,
     ): Promise<CodeManagementIssue | null> {
-        const { organizationAndTeamData, repository, issueNumber } = params;
+        const {
+            organizationAndTeamData,
+            repository,
+            issueNumber,
+            includeArtifacts,
+        } = params;
 
         const octokit = await this.getAuthenticatedOctokit(
             organizationAndTeamData,
@@ -3738,6 +3743,13 @@ export class GithubService
                         sub_issues_summary?: { total?: number };
                     },
                 )),
+                ...(includeArtifacts
+                    ? await this.issueArtifacts(
+                          octokit,
+                          repository,
+                          issueNumber,
+                      )
+                    : {}),
             };
         } catch (error) {
             if ((error as { status?: number })?.status === 404) {
@@ -3745,6 +3757,93 @@ export class GithubService
             }
             throw error;
         }
+    }
+
+    /**
+     * The artifacts GitHub attaches to an issue (public preview), from the
+     * List endpoint alone: each item carries its name and current body. Read
+     * through the issue's own repository only. Never throws: what could not
+     * be read is named in `unreadArtifacts`, so the review can say its
+     * Business Logic coverage is incomplete.
+     */
+    private async issueArtifacts(
+        octokit: Awaited<ReturnType<typeof this.getAuthenticatedOctokit>>,
+        repository: { owner: string; name: string },
+        issueNumber: number,
+    ): Promise<{
+        artifacts?: NonNullable<CodeManagementIssue['artifacts']>;
+        unreadArtifacts?: NonNullable<CodeManagementIssue['unreadArtifacts']>;
+    }> {
+        const API_VERSION = '2026-03-10';
+        const PER_PAGE = 100;
+        const TIMEOUT_MS = 10_000;
+        let list: unknown;
+        try {
+            list = (
+                await (
+                    octokit.request as unknown as (
+                        route: string,
+                        params: Record<string, unknown>,
+                    ) => Promise<{ data: unknown }>
+                )('GET /repos/{owner}/{repo}/issues/{issue_number}/artifacts', {
+                    owner: repository.owner,
+                    repo: repository.name,
+                    issue_number: issueNumber,
+                    per_page: PER_PAGE,
+                    headers: { 'X-GitHub-Api-Version': API_VERSION },
+                    request: { signal: AbortSignal.timeout(TIMEOUT_MS) },
+                })
+            ).data;
+        } catch (error) {
+            const status = (error as { status?: unknown })?.status;
+            // 404: the feature is unavailable here (GHES, older API, preview off).
+            if (status === 404) {
+                return {};
+            }
+            return {
+                unreadArtifacts: [
+                    {
+                        reason: 'list_failed',
+                        ...(typeof status === 'number' ? { status } : {}),
+                    },
+                ],
+            };
+        }
+        if (!Array.isArray(list)) {
+            return { unreadArtifacts: [{ reason: 'invalid_payload' }] };
+        }
+
+        const artifacts: NonNullable<CodeManagementIssue['artifacts']> = [];
+        const unread: NonNullable<CodeManagementIssue['unreadArtifacts']> = [];
+        for (const item of list as Array<Record<string, unknown>>) {
+            const number = item?.number;
+            const name = typeof item?.name === 'string' ? item.name : undefined;
+            if (
+                typeof number !== 'number' ||
+                !Number.isInteger(number) ||
+                number < 1 ||
+                !name?.trim() ||
+                typeof item.body !== 'string' ||
+                !item.body.trim()
+            ) {
+                unread.push({
+                    ...(typeof number === 'number' ? { number } : {}),
+                    ...(name ? { name } : {}),
+                    reason: 'invalid_payload',
+                });
+            } else {
+                artifacts.push({ number, name, content: item.body });
+            }
+        }
+        if (list.length >= PER_PAGE) {
+            // A full page: there may be more artifacts than were listed.
+            unread.push({ reason: 'may_have_more' });
+        }
+
+        return {
+            ...(artifacts.length ? { artifacts } : {}),
+            ...(unread.length ? { unreadArtifacts: unread } : {}),
+        };
     }
 
     /**
