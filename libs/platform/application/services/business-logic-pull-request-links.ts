@@ -8,11 +8,12 @@ import { CodeManagementService } from '@libs/platform/infrastructure/adapters/se
 
 /**
  * The request with lazy lookups of the issues the host ties to the PR (its
- * Development sidebar, closing keywords, issues that mention it). Both are
- * read at most once, from one call, and only when a resolution step asks:
- * a PR whose command or description names the task never pays for them. A
- * failed lookup answers with none. A request with no PR, or no owner to
- * query under, is left as it is.
+ * Development sidebar, closing keywords, issues that mention it). Only GitHub
+ * has them: any other platform's request is left as it is. Each lookup runs
+ * only when a resolution step asks (a PR whose command or description names
+ * the task never pays for them), and the two share one memoised read of the
+ * host. A failed lookup answers with none. A request with no PR, or no owner
+ * to query under, is left as it is too.
  */
 export function withPullRequestLinks(
     request: BusinessValidationRequest,
@@ -21,6 +22,7 @@ export function withPullRequestLinks(
     const { repository, pullRequest, organizationAndTeamData } = request;
     const owner = repository?.owner ?? repository?.fullName?.split('/')[0];
     if (
+        String(request.platformType).toUpperCase() !== PlatformType.GITHUB ||
         request.pullRequestLinks ||
         !repository?.name ||
         !owner ||

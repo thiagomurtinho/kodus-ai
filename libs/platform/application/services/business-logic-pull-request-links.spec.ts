@@ -60,4 +60,36 @@ describe('withPullRequestLinks', () => {
         expect(withPullRequestLinks(noPr, code as any)).toBe(noPr);
         expect(withPullRequestLinks(noOwner, code as any)).toBe(noOwner);
     });
+
+    it.each([['GITLAB'], ['BITBUCKET'], ['AZURE_REPOS'], [undefined]])(
+        'leaves a %s request as it is: only GitHub has these links',
+        (platformType) => {
+            const code = { getPullRequestLinkedIssues: jest.fn() };
+            const other = request({ platformType });
+            expect(withPullRequestLinks(other, code as any)).toBe(other);
+            expect(code.getPullRequestLinkedIssues).not.toHaveBeenCalled();
+        },
+    );
+
+    it('takes the platform name in any case', () => {
+        const code = { getPullRequestLinkedIssues: jest.fn() };
+        expect(
+            withPullRequestLinks(
+                request({ platformType: 'github' }),
+                code as any,
+            ).pullRequestLinks,
+        ).toBeDefined();
+    });
+
+    it('keeps the links a caller already set', () => {
+        const code = { getPullRequestLinkedIssues: jest.fn() };
+        const own = {
+            closingIssues: async () => [],
+            crossReferencingIssues: async () => [],
+        };
+        const withLinks = request({ pullRequestLinks: own });
+        expect(
+            withPullRequestLinks(withLinks, code as any).pullRequestLinks,
+        ).toBe(own);
+    });
 });
