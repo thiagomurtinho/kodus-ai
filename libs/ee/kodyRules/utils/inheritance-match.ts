@@ -17,6 +17,12 @@ export function matchesInheritance(
         repositoryId?: string;
         useInclude?: boolean;
         useExclude?: boolean;
+        /**
+         * Skip the `inheritable` switch and honor only exclude and include.
+         * The code review uses it: a global rule marked non-inheritable still
+         * reviews every repository it is not excluded from.
+         */
+        ignoreInheritable?: boolean;
     },
 ): boolean {
     const {
@@ -24,20 +30,20 @@ export function matchesInheritance(
         repositoryId,
         useInclude = true,
         useExclude = true,
+        ignoreInheritable = false,
     } = filters;
     // If we aren't checking a specific directory or repository, all rules match.
     if (!directoryId && !repositoryId) {
         return true;
     }
 
-    const {
-        inheritable = true,
-        exclude = [],
-        include = [],
-    } = rule.inheritance ?? {};
+    // A null list or switch reads like an absent one.
+    const inheritable = rule.inheritance?.inheritable ?? true;
+    const exclude = rule.inheritance?.exclude ?? [];
+    const include = rule.inheritance?.include ?? [];
 
     // If the rule is not inheritable, it doesn't match.
-    if (!inheritable) {
+    if (!ignoreInheritable && !inheritable) {
         return false;
     }
 

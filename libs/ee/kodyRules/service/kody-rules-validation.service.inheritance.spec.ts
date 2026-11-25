@@ -7,7 +7,9 @@ import { KodyRulesValidationService } from './kody-rules-validation.service';
 
 /**
  * The review (filterKodyRules) applies a global rule's or memory's
- * `inheritance` exactly as the UI listing (getKodyRulesForFolder) does.
+ * `inheritance` exclude and include as the inheritance matcher does, the one
+ * behind the UI listing (getKodyRulesForFolder). The `inheritable` switch is
+ * not read by the review.
  * Synthetic rules only.
  */
 describe('KodyRulesValidationService.filterKodyRules: inheritance of global rules', () => {
@@ -99,13 +101,76 @@ describe('KodyRulesValidationService.filterKodyRules: inheritance of global rule
         expect(reviewed([rule], 'repoB').standard).toEqual([]);
     });
 
-    it('drops a global rule that is not inheritable', () => {
+    it('keeps a global rule marked non-inheritable in the review, as it always has', () => {
         const rule = global('g1', {
             inheritable: false,
             exclude: [],
             include: [],
         });
+        expect(reviewed([rule], 'repoA').standard).toEqual(['g1']);
+    });
+
+    it('still honors the exclude of a non-inheritable global rule', () => {
+        const rule = global('g1', {
+            inheritable: false,
+            exclude: ['repoA'],
+            include: [],
+        });
         expect(reviewed([rule], 'repoA').standard).toEqual([]);
+        expect(reviewed([rule], 'repoB').standard).toEqual(['g1']);
+    });
+
+    it('still drops a non-inheritable global rule from the UI listing', () => {
+        const rule = global('g1', {
+            inheritable: false,
+            exclude: [],
+            include: [],
+        });
+        expect(ui([rule], 'repoA')).toEqual([]);
+    });
+
+    it('reads a null list or switch like an absent one', () => {
+        for (const inheritance of [
+            { inheritable: true, exclude: null, include: [] },
+            { inheritable: true, exclude: [], include: null },
+            { inheritable: null, exclude: [], include: [] },
+            { inheritable: null, exclude: null, include: null },
+        ]) {
+            const rules = [
+                global('g1', inheritance),
+                global('m1', inheritance, KodyRulesType.MEMORY),
+            ];
+            expect(reviewed(rules, 'repoA')).toEqual({
+                standard: ['g1'],
+                memory: ['m1'],
+            });
+            expect(ui(rules, 'repoA').sort()).toEqual(['g1', 'm1']);
+        }
+    });
+
+    it('leaves the rules alone when the review names no repository (the CLI says `global`)', () => {
+        const rules = [
+            global('g1', {
+                inheritable: true,
+                exclude: ['global'],
+                include: [],
+            }),
+            global('g2', {
+                inheritable: true,
+                exclude: [],
+                include: ['repoA'],
+            }),
+            global('g3', {
+                inheritable: true,
+                exclude: ['repoA'],
+                include: [],
+            }),
+        ];
+        expect(reviewed(rules, 'global').standard.sort()).toEqual([
+            'g1',
+            'g2',
+            'g3',
+        ]);
     });
 
     it('honors an excluded directory of the reviewed repository', () => {
@@ -118,13 +183,12 @@ describe('KodyRulesValidationService.filterKodyRules: inheritance of global rule
         expect(reviewed([rule], 'repoA', 'dirY').standard).toEqual(['g1']);
     });
 
-    it('keeps the review in step with the UI listing for every inheritance shape', () => {
+    it('keeps the review in step with the inheritance matcher for every exclude and include shape', () => {
         const shapes = [
             null,
             { inheritable: true, exclude: ['repoA'], include: [] },
             { inheritable: true, exclude: [], include: ['repoA'] },
             { inheritable: true, exclude: ['repoA'], include: ['repoA'] },
-            { inheritable: false, exclude: [], include: [] },
             { inheritable: true, exclude: ['dirX'], include: [] },
         ];
         for (const shape of shapes) {

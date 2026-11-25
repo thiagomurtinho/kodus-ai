@@ -137,8 +137,20 @@ export class KodyRulesValidationService {
             if (rule.repositoryId === 'global') {
                 // A global rule or memory the org excluded from this
                 // repository (or directory) is not part of its review, as in
-                // the UI listing.
-                if (matchesInheritance(rule, { repositoryId, directoryId })) {
+                // the UI listing. Its `inheritable` switch is not read here:
+                // the review has always applied such rules.
+                if (
+                    matchesInheritance(rule, {
+                        // The CLI names `global` when it can't tell the
+                        // repository: nothing to exclude it from.
+                        repositoryId:
+                            repositoryId === 'global'
+                                ? undefined
+                                : repositoryId,
+                        directoryId,
+                        ignoreInheritable: true,
+                    })
+                ) {
                     globalRules.push(rule);
                 }
                 continue;
