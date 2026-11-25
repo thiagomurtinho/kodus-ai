@@ -505,3 +505,68 @@ describe('Business Logic reference resolution: title, branch and body mentions',
         expect(found).toEqual({ kind: 'found', ids: ['#12', 'KOD-30'] });
     });
 });
+
+describe('Business Logic reference resolution: ambiguity never hides a failure', () => {
+    /** A Git Issues tracker whose host is down. */
+    const down = () => ({
+        name: 'Git Issues',
+        canRead: (reference: TaskReference) => reference.kind === 'git_issue',
+        read: async () => ({
+            status: 'error' as const,
+            message: 'Git Issues failed',
+            tools: [],
+        }),
+        close: async () => undefined,
+    });
+
+    it('keeps tracker_unavailable, and tells the team, when issues mention the PR and the tracker is down', async () => {
+        const service = setup([down()]);
+        const notify = jest
+            .spyOn(service as any, 'notifySourceUnavailable')
+            .mockResolvedValue(undefined);
+        const decide = jest
+            .spyOn(service as any, 'decide')
+            .mockResolvedValue({ kind: 'skipped', reason: 'x', message: '' });
+        await (service as any).run(
+            request(
+                {
+                    title: 'Add the profile',
+                    body: 'Closes #77',
+                    headRef: 'feature/x',
+                },
+                {
+                    pullRequestLinks: links(
+                        [],
+                        [{ number: 12 }, { number: 14 }],
+                    ),
+                },
+            ),
+        );
+        expect(decide.mock.calls[0][2]).toMatchObject({
+            kind: 'tracker_unavailable',
+        });
+        expect(decide.mock.calls[0][2].candidates).toBeUndefined();
+        expect(notify).toHaveBeenCalledTimes(1);
+    });
+
+    it('still lists the candidates when the only thing tried was a body mention that reads as no task', async () => {
+        const outcome = await told(
+            setup([gitIssues(titles).tracker]),
+            request(
+                {
+                    title: 'Add the profile',
+                    body: 'See #123 for context',
+                    headRef: 'feature/x',
+                },
+                {
+                    pullRequestLinks: links(
+                        [],
+                        [{ number: 12 }, { number: 14 }],
+                    ),
+                },
+            ),
+        );
+        expect(outcome.message).toContain('#12');
+        expect(outcome.message).toContain('#14');
+    });
+});

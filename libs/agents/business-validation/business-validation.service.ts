@@ -472,7 +472,12 @@ export class BusinessValidationService {
         }
 
         const attempts = failures.flatMap((f) => f.resolution.attempts);
-        if (mentioning.length > 1) {
+        // The author is asked to choose only when nothing else went wrong:
+        // a tracker that was down, or a release, keeps its own answer.
+        if (
+            mentioning.length > 1 &&
+            failures.every((f) => f.resolution.kind === 'no_reference')
+        ) {
             return {
                 resolution: {
                     kind: 'no_reference',
