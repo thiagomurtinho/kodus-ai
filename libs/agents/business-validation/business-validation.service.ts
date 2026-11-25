@@ -381,9 +381,10 @@ export class BusinessValidationService {
 
     /**
      * Which task a PR is checked against, stopping at the first step that
-     * reads one: the issues GitHub links to the PR, what the title and
-     * description state or cite, the one issue that mentions the PR, and last
-     * the branch (a hint; a key it carries never hides the steps before).
+     * reads one: the issues GitHub links to the PR and what its title names,
+     * what the description states or cites, the one issue that mentions the
+     * PR, the branch (a hint; a key it carries never hides the steps before)
+     * and last what the description only mentions.
      * When nothing reads, the most telling failure stands, and several
      * issues that mention the PR are named for the author to choose from.
      */
@@ -434,14 +435,19 @@ export class BusinessValidationService {
             }
         };
 
+        // What GitHub links to the PR and what its title names are both
+        // explicit, and judged together (up to MAX_REFERENCES).
         const native = await linked(links?.closingIssues);
-        const byLink = await attempt(native.map(linkedIssueReference));
+        const byLink = await attempt([
+            ...native.map(linkedIssueReference),
+            ...steps.title,
+        ]);
         if (byLink) {
             return byLink;
         }
-        const byText = await attempt(steps.text);
-        if (byText) {
-            return byText;
+        const byBody = await attempt(steps.body);
+        if (byBody) {
+            return byBody;
         }
         // Issues that mention the PR are asked for only when no link and
         // nothing the author wrote read as a task, and used only when there
@@ -457,6 +463,12 @@ export class BusinessValidationService {
         const byBranch = await attempt(steps.branch);
         if (byBranch) {
             return byBranch;
+        }
+        // Last: what the description only mentions (a follow-up, a related
+        // task), judged only when nothing else named a task.
+        const byMentions = await attempt(steps.mentions);
+        if (byMentions) {
+            return byMentions;
         }
 
         const attempts = failures.flatMap((f) => f.resolution.attempts);

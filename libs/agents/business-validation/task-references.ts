@@ -177,25 +177,30 @@ export function selectReferences(
 }
 
 /**
- * The references of a PR in the order they are tried: what the command was
- * given, then what the title and description state or cite, and last the
- * branch, which is a hint (`work/341-profile`), never a statement. A key a
- * branch carries (`WORK-341`) is therefore tried only after the description,
- * so a team's branch convention can't hide the issue the description cites.
- * Native links and cross-references sit between these steps; the caller adds
- * them.
+ * The references of a PR, by how firmly the PR names them, in the order they
+ * are tried: what the command was given; the title; what the description
+ * states or cites (`Closes #12`, `Refs org/repo#12`); the branch, a hint and
+ * never a statement (a key like `WORK-341` it carries is tried only after the
+ * description, so a team's branch convention can't hide a cited issue); and
+ * last what the description merely mentions (`Follow-up to PAY-12`), which
+ * is another task far more often than the PR's own. Native links and
+ * cross-references sit between these steps; the caller adds them.
  */
 export function splitReferenceSteps(references: TaskReference[]): {
     command: TaskReference[];
-    text: TaskReference[];
+    title: TaskReference[];
+    body: TaskReference[];
     branch: TaskReference[];
+    mentions: TaskReference[];
 } {
+    const inBody = references.filter((r) => r.source === 'body');
+    const named = (r: TaskReference) => r.intent !== 'mentions' || r.cited;
     return {
         command: references.filter((r) => r.source === 'command'),
-        text: references.filter(
-            (r) => r.source === 'title' || r.source === 'body',
-        ),
+        title: references.filter((r) => r.source === 'title'),
+        body: inBody.filter(named),
         branch: references.filter((r) => r.source === 'branch'),
+        mentions: inBody.filter((r) => !named(r)),
     };
 }
 

@@ -452,3 +452,56 @@ describe('Business Logic reference resolution: several native links and key bran
         expect(found).toEqual({ kind: 'found', ids: ['PAY-42'] });
     });
 });
+
+describe('Business Logic reference resolution: title, branch and body mentions', () => {
+    it('judges the key the branch carries before one the description only mentions', async () => {
+        const { tracker } = gitIssues(titles);
+        const found = await resolved(
+            setup([
+                jira({ 'PAY-42': 'Refund flow', 'PAY-12': 'Older work' }),
+                tracker,
+            ]),
+            request(
+                {
+                    title: 'Add refunds',
+                    body: 'Follow-up to PAY-12',
+                    headRef: 'feature/PAY-42-refunds',
+                },
+                { pullRequestLinks: links() },
+            ),
+        );
+        expect(found).toEqual({ kind: 'found', ids: ['PAY-42'] });
+    });
+
+    it('falls back to a key the description only mentions when nothing else names a task', async () => {
+        const { tracker } = gitIssues(titles);
+        const found = await resolved(
+            setup([jira({ 'PAY-12': 'Older work' }), tracker]),
+            request(
+                {
+                    title: 'Add refunds',
+                    body: 'Follow-up to PAY-12',
+                    headRef: 'feature/x',
+                },
+                { pullRequestLinks: links() },
+            ),
+        );
+        expect(found).toEqual({ kind: 'found', ids: ['PAY-12'] });
+    });
+
+    it('judges the native link together with a key the title names', async () => {
+        const { tracker } = gitIssues(titles);
+        const found = await resolved(
+            setup([jira({ 'KOD-30': 'Profile epic' }), tracker]),
+            request(
+                {
+                    title: 'KOD-30 Add the profile',
+                    body: 'Closes #12',
+                    headRef: 'feature/x',
+                },
+                { pullRequestLinks: links([{ number: 12 }]) },
+            ),
+        );
+        expect(found).toEqual({ kind: 'found', ids: ['#12', 'KOD-30'] });
+    });
+});

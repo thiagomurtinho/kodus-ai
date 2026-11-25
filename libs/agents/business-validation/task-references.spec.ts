@@ -510,28 +510,40 @@ describe('splitReferenceSteps', () => {
             command: '#5',
             title: 'feat: profile (PAY-42)',
             branch: 'work-341/kodus-profile',
-            body: 'Refs org/repo#341',
+            body: 'Refs org/repo#341. Follow-up to PAY-12. Closes #77.',
         }),
     );
     const ids = (refs: Array<{ id: string }>) => refs.map((r) => r.id);
 
-    it('keeps the command, the title and description, and the branch apart', () => {
+    it('keeps the command, the title, what the description names, the branch and its mentions apart', () => {
         expect(ids(steps.command)).toEqual(['5']);
-        expect(ids(steps.text)).toEqual(['PAY-42', '341']);
+        expect(ids(steps.title)).toEqual(['PAY-42']);
+        expect(ids(steps.body)).toEqual(['341', '77']);
         expect(ids(steps.branch)).toEqual(['WORK-341']);
+        expect(ids(steps.mentions)).toEqual(['PAY-12']);
     });
 
-    it('leaves a key the branch carries out of the text step, so it cannot hide a cited issue', () => {
+    it('treats a cited or stated body reference as named, and a bare mention as not', () => {
+        const { body, mentions } = splitReferenceSteps(
+            extractTaskReferences({
+                body: 'Part of PAY-3\nSee PAY-4\nRelated: PAY-5 and https://acme.atlassian.net/browse/PAY-6',
+            }),
+        );
+        expect(ids(body)).toEqual(['PAY-3', 'PAY-4']);
+        expect(ids(mentions)).toEqual(['PAY-5', 'PAY-6']);
+    });
+
+    it('leaves a key the branch carries out of the description step, so it cannot hide a cited issue', () => {
         const refs = extractTaskReferences({
             branch: 'work-341/kodus-profile',
             body: 'Refs org/repo#341',
         });
-        // Today's rule: the stated branch key wins over the body citation.
+        // The whole-PR rule: the stated branch key wins over the body citation.
         expect(selectReferences(refs, 3)?.map((r) => r.id)).toEqual([
             'WORK-341',
         ]);
-        const { text } = splitReferenceSteps(refs);
-        expect(selectReferences(text, 3)?.map((r) => r.id)).toEqual(['341']);
+        const { body } = splitReferenceSteps(refs);
+        expect(selectReferences(body, 3)?.map((r) => r.id)).toEqual(['341']);
     });
 });
 
