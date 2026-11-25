@@ -16,6 +16,8 @@ import {
 } from '@libs/kodyRules/domain/interfaces/kodyRules.interface';
 import { Injectable } from '@nestjs/common';
 
+import { matchesInheritance } from '../utils/inheritance-match';
+
 /**
  * Service for validating and ordering Kody Rules in cloud mode
  */
@@ -133,7 +135,12 @@ export class KodyRulesValidationService {
             }
 
             if (rule.repositoryId === 'global') {
-                globalRules.push(rule);
+                // A global rule or memory the org excluded from this
+                // repository (or directory) is not part of its review, as in
+                // the UI listing.
+                if (matchesInheritance(rule, { repositoryId, directoryId })) {
+                    globalRules.push(rule);
+                }
                 continue;
             }
 
@@ -339,58 +346,13 @@ export class KodyRulesValidationService {
             );
         };
 
-        const isInheritanceMatch = (rule: Partial<IKodyRule>): boolean => {
-            // If we aren't checking a specific directory or repository, all rules match.
-            if (!directoryId && !repositoryId) {
-                return true;
-            }
-
-            const {
-                inheritable = true,
-                exclude = [],
-                include = [],
-            } = rule.inheritance ?? {};
-
-            // If the rule is not inheritable, it doesn't match.
-            if (!inheritable) {
-                return false;
-            }
-
-            // Cross-directory leak guard. The historical default for a
-            // rule's `inheritance.include` is `[]`, which the matcher
-            // below reads as "inherit everywhere" — and so a rule
-            // scoped to one directory would silently apply in every
-            // sibling directory of the same repo (customer-reported
-            // on rule b207a89c).
-            //
-            // A directory-scoped rule (`rule.directoryId` set) must NOT
-            // leak into a different directory unless that directory is
-            // explicitly in `include`. Repo-level and global rules
-            // (`rule.directoryId` undefined) keep their original
-            // semantics and continue to match across all contexts.
-            if (
-                directoryId &&
-                rule.directoryId &&
-                rule.directoryId !== directoryId &&
-                !include.includes(directoryId)
-            ) {
-                return false;
-            }
-
-            // Check if the current directory or repository is excluded or included
-            const isExcluded =
-                useExclude &&
-                ((directoryId && exclude.includes(directoryId)) ||
-                    (repositoryId && exclude.includes(repositoryId)));
-
-            const isIncluded =
-                useInclude &&
-                ((directoryId && include.includes(directoryId)) ||
-                    (repositoryId && include.includes(repositoryId)));
-
-            // If excluded, it doesn't match. If not excluded, it matches if include is empty or it is included.
-            return !isExcluded && (include.length === 0 || isIncluded);
-        };
+        const isInheritanceMatch = (rule: Partial<IKodyRule>): boolean =>
+            matchesInheritance(rule, {
+                directoryId,
+                repositoryId,
+                useInclude,
+                useExclude,
+            });
 
         return kodyRules?.filter((rule) => {
             if (!rule) {
