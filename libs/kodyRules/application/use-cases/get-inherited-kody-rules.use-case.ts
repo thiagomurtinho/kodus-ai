@@ -156,9 +156,10 @@ export class GetInheritedRulesKodyRulesUseCase {
         const directoryRules = [];
 
         for (const rule of rules) {
-            const excluded = rule.inheritance?.exclude?.includes(
-                directoryId || repositoryId,
-            );
+            const excluded =
+                (!!directoryId &&
+                    !!rule.inheritance?.exclude?.includes(directoryId)) ||
+                !!rule.inheritance?.exclude?.includes(repositoryId);
 
             if (rule.repositoryId === 'global') {
                 // it comes from global rules
