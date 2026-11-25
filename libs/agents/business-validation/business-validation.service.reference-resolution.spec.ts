@@ -92,7 +92,9 @@ function links(closing: IssueRef[] = [], crossReferencing: IssueRef[] = []) {
 }
 
 function setup(trackers: unknown[]) {
-    (buildTaskTrackers as jest.Mock).mockReturnValueOnce(trackers);
+    // Not `...Once`: a run that never builds trackers (no reference, no link)
+    // would leave its answer queued for the next test.
+    (buildTaskTrackers as jest.Mock).mockReturnValue(trackers);
     const service = new BusinessValidationService(
         { getConnections: async () => [] } as any,
         {} as any,
