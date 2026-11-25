@@ -7,7 +7,11 @@ import {
 
 import { decryptCliSecret } from '@libs/code-review/domain/custom-agents/cli-secret-cipher';
 import { CLI_SECRET_MASK } from '@libs/code-review/domain/custom-agents/cli-secrets';
-import { CUSTOM_AGENTS_PLAN_REQUIRED } from '@libs/code-review/infrastructure/agents/custom-agents/custom-agents-plan';
+import {
+    CUSTOM_AGENTS_BETA_REQUIRED,
+    CUSTOM_AGENTS_PLAN_REQUIRED,
+} from '@libs/code-review/infrastructure/agents/custom-agents/custom-agents-plan';
+import { environment } from '@libs/ee/configs/environment';
 
 import {
     GetCustomAgentsStatusUseCase,
@@ -18,6 +22,16 @@ import {
     TRY_RUN_STALE_MS,
     TryCustomAgentUseCase,
 } from './try-custom-agent.use-case';
+
+// Custom agents read the install's mode. Pinned to Cloud here, as CI runs;
+// the self-hosted cases below switch it.
+jest.mock('@libs/ee/configs/environment', () => {
+    const actual = jest.requireActual('@libs/ee/configs/environment');
+    return {
+        ...actual,
+        environment: { ...actual.environment, API_CLOUD_MODE: true },
+    };
+});
 
 const organizationAndTeamData = { organizationId: 'org-1', teamId: 'team-1' };
 
@@ -1175,6 +1189,56 @@ describe('TryCustomAgentUseCase', () => {
         expect(runner.runCustomAgentOnPullRequest).not.toHaveBeenCalled();
     });
 
+    // Custom agents are a beta feature: a self-hosted install runs them only
+    // with BETA_FEATURES=true, whatever its plan (#2425).
+    describe('on a self-hosted install', () => {
+        const betaFeatures = process.env.BETA_FEATURES;
+        const tryIt = (runner: { runCustomAgentOnPullRequest: jest.Mock }) =>
+            new TryCustomAgentUseCase(
+                parametersService(storedConfig()) as any,
+                licenseService(TEAMS) as any,
+                runner,
+            ).execute({
+                organizationAndTeamData,
+                repositoryId: 'repo-1',
+                prUrl: 'https://git.example.test/ledger/pull/7',
+                agent: ledgerAgent(),
+            });
+
+        beforeEach(() => {
+            environment.API_CLOUD_MODE = false;
+            delete process.env.BETA_FEATURES;
+        });
+
+        afterEach(() => {
+            environment.API_CLOUD_MODE = true;
+            if (betaFeatures === undefined) {
+                delete process.env.BETA_FEATURES;
+            } else {
+                process.env.BETA_FEATURES = betaFeatures;
+            }
+        });
+
+        it.each([
+            ['unset', undefined],
+            ['false', 'false'],
+        ])(
+            'refuses with BETA_FEATURES %s without running the agent',
+            async (_name, value) => {
+                if (value !== undefined) process.env.BETA_FEATURES = value;
+                const runner = { runCustomAgentOnPullRequest: jest.fn() };
+
+                const run = tryIt(runner);
+
+                await expect(run).rejects.toBeInstanceOf(ForbiddenException);
+                await expect(run).rejects.toThrow(CUSTOM_AGENTS_BETA_REQUIRED);
+                expect(
+                    runner.runCustomAgentOnPullRequest,
+                ).not.toHaveBeenCalled();
+            },
+        );
+    });
+
     it('runs on a trial', async () => {
         const runner = {
             runCustomAgentOnPullRequest: jest.fn().mockResolvedValue(trace),
@@ -1445,31 +1509,22 @@ describe('GetCustomAgentsStatusUseCase', () => {
     });
 
     it('reads file and PR-level findings of the repository over 30 days', async () => {
-        const aggregate = jest
-            .fn()
-            // The unfollowed-citations read finds nothing here.
-            .mockReturnValue({ toArray: async () => [] })
-            .mockReturnValueOnce({
-                toArray: async () => [
-                    {
-                        agentId: 'ledger-agent',
-                        prNumber: 7,
-                        deliveryStatus: 'sent',
-                    },
-                ],
-            })
-            .mockReturnValueOnce({
-                toArray: async () => [
-                    {
-                        agentId: 'ledger-agent',
-                        prNumber: 8,
-                        deliveryStatus: 'sent',
-                    },
-                ],
-            });
-        const useCase = new GetCustomAgentsStatusUseCase({
-            getNativeCollection: () => ({ aggregate }),
-        } as any);
+        const repository = {
+            findCustomAgentSuggestionRows: jest.fn(async () => [
+                {
+                    agentId: 'ledger-agent',
+                    prNumber: 7,
+                    deliveryStatus: 'sent',
+                },
+                {
+                    agentId: 'ledger-agent',
+                    prNumber: 8,
+                    deliveryStatus: 'sent',
+                },
+            ]),
+            findUnfollowedCustomAgentCitations: jest.fn(async () => []),
+        };
+        const useCase = new GetCustomAgentsStatusUseCase(repository as any);
 
         const result = await useCase.execute({
             organizationId: 'org-1',
@@ -1486,27 +1541,16 @@ describe('GetCustomAgentsStatusUseCase', () => {
                 dropped: 0,
             },
         ]);
-        // Mongo groups the findings per agent, PR and status, so the rows
-        // read into memory are bounded by those, not by finding volume.
-        const pipeline = aggregate.mock.calls[0][0];
-        expect(pipeline.find((stage) => stage.$group)).toEqual({
-            $group: expect.objectContaining({
-                _id: {
-                    agentId: expect.any(String),
-                    prNumber: expect.any(String),
-                    deliveryStatus: expect.any(String),
-                    priorityStatus: expect.any(String),
-                },
-                count: { $sum: 1 },
-            }),
-        });
-        expect(aggregate.mock.calls[0][1]).toEqual({ allowDiskUse: true });
-        const [firstMatch] = aggregate.mock.calls[0][0];
-        expect(firstMatch.$match).toEqual({
-            'organizationId': 'org-1',
-            'repository.id': 'repo-1',
-            'updatedAt': { $gte: new Date('2026-09-17T00:00:00Z') },
-            'files.suggestions.customAgent.id': { $exists: true },
-        });
+        const scope = {
+            organizationId: 'org-1',
+            repositoryId: 'repo-1',
+            since: new Date('2026-09-17T00:00:00Z'),
+        };
+        expect(repository.findCustomAgentSuggestionRows).toHaveBeenCalledWith(
+            scope,
+        );
+        expect(
+            repository.findUnfollowedCustomAgentCitations,
+        ).toHaveBeenCalledWith(scope);
     });
 });

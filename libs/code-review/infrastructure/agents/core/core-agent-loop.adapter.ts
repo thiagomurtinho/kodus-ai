@@ -29,7 +29,10 @@ import {
 import type { AgentSpec } from '@libs/agent-harness/domain/contracts/agent.contract';
 import { AiSdkAgentRunner } from '@libs/agent-harness/infrastructure/ai-sdk/ai-sdk-agent-runner';
 
-import { ContextWindowCompressor } from '@libs/agent-harness/infrastructure/compression/context-window-compressor';
+import {
+    ContextWindowCompressor,
+    DEFAULT_SAFETY_MARGIN_RATIO,
+} from '@libs/agent-harness/infrastructure/compression/context-window-compressor';
 import { CompressionPolicy } from '@libs/agent-harness/infrastructure/policies/compression.policy';
 import { OverflowRecoveringRunner } from './overflow-recovering-runner';
 import { estimateOverheadTokens } from '@libs/agent-harness/infrastructure/compression/token-estimator';
@@ -38,7 +41,6 @@ import { buildFinderToolRegistry } from '@libs/code-review/infrastructure/agents
 import { buildRepoInstructionTool } from '@libs/code-review/infrastructure/agents/adapters/repo-instruction-tool';
 import { InMemoryToolRegistry } from '@libs/agent-harness/infrastructure/tools/in-memory-tool-registry';
 import {
-    FINDER_DONE_TOOL,
     buildFinderAgentSpec,
     runFinderWithVerify,
     recoverFindingsFromProse,
@@ -48,9 +50,11 @@ import {
     buildFindingsFromVerify,
     summarizeFunnel,
 } from '@libs/code-review/infrastructure/agents/core/review-finding';
-import { inspectFindingsResult } from '@libs/code-review/infrastructure/agents/core/findings-schema';
+import {
+    submittedWholeByTool,
+    submittedWholeResult,
+} from '@libs/code-review/infrastructure/agents/core/submitted-result';
 import { buildHeavyLensRun } from '@libs/ee/heavy-mode/heavy-lens-passes';
-import type { RunState } from '@libs/agent-harness/domain/contracts/run-state.contract';
 import { createLogger } from '@libs/core/log/logger';
 import {
     type AgentLoopInput,
@@ -58,6 +62,8 @@ import {
     type AgentLoopSecrets,
     type VerificationTraceSummary,
 } from '@libs/code-review/infrastructure/agents/review-agent.contract';
+import { declaredAnswerTokens } from '@libs/llm/model-invocation';
+import { slotContextWindow, slotInputRoom } from '@libs/llm/slot-window';
 import { createAgentRunContext } from '@libs/llm/agent-run-context';
 import { buildProviderOptions } from '@libs/llm/reasoning-options';
 // buildAgentAnomalies is review-specific (anomaly summary shapes) — lives in its
@@ -107,6 +113,7 @@ export function finderRunEnvironment(
         callGraph: input.callGraph,
         outlineFirst: input.outlineFirst,
         linkedRepoAccess: secrets.linkedRepoAccess,
+        referenceRepositories: secrets.referenceRepositories,
         extraTools: secrets.extraTools,
     });
     // Without a sandbox or tools of the agent's own there are no repository
@@ -257,68 +264,6 @@ export function finderRunEnvironment(
     };
 }
 
-/**
- * Whether a run submitted its result whole through the result tool. The
- * runner makes an artifact of every requested result call, executed or not,
- * so a turn cut while writing submitResult leaves one holding raw,
- * unparseable input, an object that is no findings result (`{}`), or items
- * recovery had to drop: only a result that arrived whole counts. The last
- * one is the one the review publishes (extractFindings reads the last).
- */
-function submittedWholeByTool(state: RunState): boolean {
-    const published = [...state.artifacts]
-        .reverse()
-        .find((a) => a.type === FINDER_DONE_TOOL);
-    return !!published && isWholeResult(published.payload);
-}
-
-/**
- * Whether a run delivered a whole result: through the result tool, or written
- * as its final answer instead of calling the tool, held to the same test (one
- * that lost items to the schema is not whole). A final answer the provider cut
- * (length, content filter) is not a result, however much of it parses.
- * Reads the outcome extractFindings stamped on the state.
- */
-function submittedWholeResult(state: RunState): boolean {
-    if (submittedWholeByTool(state)) return true;
-    const stamped = state as RunState & {
-        __findingsOutcome?: string;
-        __textResult?: unknown;
-    };
-    const finalTurn = state.steps[state.steps.length - 1];
-    const finalTurnCut =
-        !!finalTurn?.finishReason &&
-        finalTurn.finishReason !== 'stop' &&
-        finalTurn.finishReason !== 'tool-calls';
-    return (
-        stamped.__findingsOutcome === 'text' &&
-        !finalTurnCut &&
-        isWholeResult(stamped.__textResult)
-    );
-}
-
-/**
- * A submitResult payload that arrived whole: the findings schema accepts it
- * and recovery dropped none of its items. On a cut turn a dropped item means
- * the result was damaged; the valid items still ship, the run is partial.
- */
-function isWholeResult(payload: unknown): boolean {
-    // Silent: extractFindings already logged this artifact. Items salvaged
-    // before a break mean a cut payload: only those items survived (escaping
-    // or dropping text after a whole array loses none). A
-    // provider text node is not a finding the cut damaged (findings-schema.ts).
-    const { result, drops, recoveries } = inspectFindingsResult(
-        payload,
-        undefined,
-        { silent: true },
-    );
-    return (
-        !!result &&
-        !recoveries.some((r) => r.includes('salvaged-items')) &&
-        drops.every((d) => d.reason === 'provider-text-node')
-    );
-}
-
 export async function runAgentLoopViaCore(
     input: AgentLoopInput,
     secrets: AgentLoopSecrets,
@@ -392,6 +337,7 @@ export async function runAgentLoopViaCore(
               contextWindowTokens,
               overheadTokens,
               providerOptions,
+              onStarted: input.onHeavyLensesStarted,
           })
         : undefined;
 
@@ -410,6 +356,42 @@ export async function runAgentLoopViaCore(
         !!verifySlot &&
         (verifySlot.provider !== secrets.byokConfig?.provider ||
             verifySlot.model !== secrets.byokConfig?.model);
+    // The check model's compressor keeps, beside the drift margin, what each
+    // attempt declares as its answer (its own limit, or what its adapter
+    // sends with none): a wide batch of reads plus a 64k answer overflowed.
+    // LLM.run re-sends a failed call to the slot's fallback with its own
+    // window and limit, so the room is the smaller of the two attempts'.
+    // The reasoning a verify run sends: the slot's own effort, with no
+    // default added (the finder and verify pass their options themselves).
+    const verifyOptionsFor = (slot: Parameters<typeof slotContextWindow>[0]) =>
+        buildProviderOptions(
+            `${input.agentName ?? 'finder'}/verify`,
+            input.telemetryMetadata,
+            {
+                reasoningEffort: slot?.reasoningEffort,
+                reasoningConfigOverride: slot?.reasoningConfigOverride,
+                byokProvider: slot?.provider,
+                modelName: slot?.model,
+                openrouterProviderOrder: slot?.openrouterProviderOrder,
+                openrouterAllowFallbacks: slot?.openrouterAllowFallbacks,
+            },
+        );
+    const verifyWindow = verifyOnOwnModel ? slotContextWindow(verifySlot) : 0;
+    const verifyRoom = verifyOnOwnModel
+        ? await slotInputRoom(
+              verifySlot,
+              async (slot) =>
+                  (await declaredAnswerTokens(
+                      slot,
+                      slot?.maxOutputTokens && slot.maxOutputTokens > 0
+                          ? slot.maxOutputTokens
+                          : undefined,
+                      // The run is configured once: its fallback attempt
+                      // sends these same options (agent-loop-call.ts).
+                      { providerOptions: verifyOptionsFor(verifySlot) },
+                  )) ?? 0,
+          )
+        : 0;
     const ownVerify = verifyOnOwnModel
         ? {
               verifyRunner: new AiSdkAgentRunner(verifySlot, {
@@ -423,21 +405,14 @@ export async function runAgentLoopViaCore(
               }),
               verifyModelId: verifySlot.model ?? 'resolved',
               verifyFallbackModelId: verifySlot.fallback?.model,
-              verifyProviderOptions: buildProviderOptions(
-                  `${input.agentName ?? 'finder'}/verify`,
-                  input.telemetryMetadata,
-                  {
-                      reasoningEffort: verifySlot.reasoningEffort,
-                      reasoningConfigOverride:
-                          verifySlot.reasoningConfigOverride,
-                      byokProvider: verifySlot.provider,
-                      modelName: verifySlot.model,
-                      openrouterProviderOrder:
-                          verifySlot.openrouterProviderOrder,
-                      openrouterAllowFallbacks:
-                          verifySlot.openrouterAllowFallbacks,
-                  },
-              ),
+              // Its own window: the check model's, not the finder's (#2233).
+              verifyCompressor: new ContextWindowCompressor(verifyWindow, {
+                  overheadTokens,
+                  safetyMarginTokens:
+                      Math.ceil(verifyWindow * DEFAULT_SAFETY_MARGIN_RATIO) +
+                      (verifyWindow - verifyRoom),
+              }),
+              verifyProviderOptions: verifyOptionsFor(verifySlot),
           }
         : {};
 
@@ -459,6 +434,7 @@ export async function runAgentLoopViaCore(
                     listGuideDir,
                     guideFiles: input.conventionGuides,
                     teamInstructions: input.teamInstructions,
+                    instructionFiles: input.repoInstructions?.files,
                     astGrepLog,
                 },
             }),
@@ -665,6 +641,7 @@ export async function runAgentLoopViaCore(
         coverage,
         verification,
         recallPasses: r.passStats,
+        ...(r.lensOutcomes && { heavyLensOutcomes: r.lensOutcomes }),
         verificationUsage: {
             inputTokens: vu.inputTokens,
             cacheReadTokens: vu.cacheReadTokens,

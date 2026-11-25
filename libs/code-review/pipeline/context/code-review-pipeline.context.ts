@@ -1,4 +1,10 @@
-import type { RequestedReviewMode } from '@libs/code-review/domain/review-mode';
+import type { ReviewCommandAccess } from '@libs/platform/application/services/commenter-access';
+import type {
+    RequestedReviewMode,
+    ReviewRoutingReason,
+} from '@libs/code-review/domain/review-mode';
+import type { RiskAssessmentResult } from '@libs/code-review/domain/risk/risk-assessment';
+import type { UltraReviewState } from '@libs/code-review/domain/ultra-review-state';
 import { readAttemptedSlot } from '@libs/llm/model-failover';
 import type {
     ContextEvidence,
@@ -21,6 +27,9 @@ import { CollectCrossFileContextsResult } from '@libs/code-review/infrastructure
 import type { TraceContextDecision } from '@libs/cli-review/domain/types/trace-context.types';
 import type { PrDecisionRecord } from '@libs/code-review/domain/contracts/pr-decision-store.contract';
 import { LlmErrorCategory } from '@libs/llm/error-classifier';
+import { resolveEnvProvider } from '@libs/llm/managed-slot';
+import { isPlatformFundedProvider } from '@libs/llm/platform-funded-provider';
+import { environment } from '@libs/ee/configs/environment';
 import type { ReviewWarning } from '@libs/code-review/infrastructure/agents/engine/review-warnings';
 import type { CustomAgentCliProvisioning } from '@libs/code-review/infrastructure/agents/custom-agent-cli/custom-agent-cli.provisioner';
 import type { LinkedRepositoriesReviewMetadata } from '@libs/ee/linked-repositories';
@@ -89,8 +98,12 @@ export interface CodeReviewPipelineContext extends PipelineContext {
     reviewDirective?: string;
 
     /** The mode the review command asked for (`@kody review --heavy` /
-     *  `--balanced`), over the review mode set in settings. */
+     *  `--balanced` / `--ultra`), over the review mode set in settings. */
     requestedReviewMode?: RequestedReviewMode;
+    /** Whether the author of a `--heavy` / `--ultra` command can write to
+     *  the repository; set by the webhook handler for those two only. */
+    requestedReviewModeAccess?: ReviewCommandAccess;
+    reviewRoutingReason?: ReviewRoutingReason;
 
     /**
      * Whether this review runs heavy: the requested mode, else the review mode
@@ -99,6 +112,14 @@ export interface CodeReviewPipelineContext extends PipelineContext {
      * short lens runs.
      */
     heavy?: boolean;
+
+    /**
+     * The Ultra review this run is (libs/ee/ultra-review): set by
+     * ValidateConfigStage when the review runs Ultra, then filled with each
+     * model's outcome and the merge by AgentReviewStage. Read by the final
+     * comment (the degraded notice) and the execution record.
+     */
+    ultra?: UltraReviewState;
 
     codeReviewConfig?: CodeReviewConfig;
     automaticReviewStatus?: AutomaticReviewStatus;
@@ -114,6 +135,8 @@ export interface CodeReviewPipelineContext extends PipelineContext {
 
     /** Arquivos filtrados COM conteúdo - após aplicar ignorePaths no FetchChangedFilesStage */
     changedFiles?: FileChange[];
+    /** Path inventory of the PR for rules that also examine prior rounds. */
+    prFilePaths?: string[];
 
     /** List of files ignored by configuration patterns */
     ignoredFiles?: string[];
@@ -136,6 +159,8 @@ export interface CodeReviewPipelineContext extends PipelineContext {
         lastAnalyzedCommit?: any;
         /** Base branch the last review read the PR against. */
         reviewedBaseBranch?: string;
+        riskAssessment?: RiskAssessmentResult;
+        approvalPolicyEligibility?: import('../services/approval-policies.service').ApprovalEligibilityCache;
     };
     /** The status note of the latest finished run, partial or failed ones
      *  included, which the next run edits (#1721). `lastExecution` is the
@@ -248,6 +273,14 @@ export interface CodeReviewPipelineContext extends PipelineContext {
     businessLogicValidatedAt?: string;
 
     /**
+     * Set by ValidatePrerequisitesStage when the "author has no Kodus
+     * license" notice was posted on the PR. Persisted to
+     * dataExecution.licenseNoticePostedAt so later pushes on the same PR skip
+     * the notice.
+     */
+    licenseNoticePostedAt?: string;
+
+    /**
      * `@kody -v <agent-slug>`: run only that custom agent on this review
      * (#2172). Unset on every other review.
      */
@@ -265,7 +298,23 @@ export interface CodeReviewPipelineContext extends PipelineContext {
 
     /** Approval policy result for this reviewed head; reused by the finish stage. */
     approvalDecision?: ApprovalDecision;
+    approvalPolicyEligibility?: import('../services/approval-policies.service').ApprovalEligibilityCache;
+    approvalReviewSummary?: {
+        lineFindings: number;
+        /** One entry per line finding. Null marks publication without a verifiable ID. */
+        lineCommentIds?: Array<string | null>;
+        prFindings: number;
+        complete: boolean;
+    };
     approvalRisk?: ApprovalRiskAssessment;
+    /** Shared pre-review result, including disabled and unavailable states. */
+    riskAssessment?: RiskAssessmentResult;
+    /** Intentional automatic skips, including reviews stopped before dispatch. */
+    customAgentRiskSkips?: Array<{ id: string; reason: string }>;
+    /** Complete base-to-head diff; never filtered for incremental review or ignorePaths. */
+    fullPrFiles?: FileChange[];
+    /** A partial diff could not establish which risk configuration applies. */
+    riskConfigurationUnavailable?: boolean;
 
     // Resultados dos comentários de nível de PR
     prLevelCommentResults?: Array<CommentResult>;
@@ -336,6 +385,14 @@ export interface CodeReviewPipelineContext extends PipelineContext {
     sandboxSuperseded?: boolean;
 
     /**
+     * Why the review has no sandbox, in words for the team, when the reason
+     * is theirs to act on: today only a Git host that refused Kodus's shared
+     * network for a team without the fixed outbound IP. The "sandbox
+     * unavailable" warning carries it instead of the generic text.
+     */
+    sandboxUnavailableDetail?: string;
+
+    /**
      * Team CLIs installed and fenced in the E2B sandbox for the custom agents
      * that will run (#2172), keyed by agent id, plus the CLI_INSTALL_FAILED
      * warnings for the ones that could not be. Absent on the local sandbox,
@@ -350,6 +407,9 @@ export interface CodeReviewPipelineContext extends PipelineContext {
 
     /** Dedup telemetry captured by AgentReviewStage and exported by benchmark tooling. */
     dedupTrace?: DedupTraceSummary;
+
+    /** When the review job's pipeline started (ms): budgets count from it. */
+    pipelineStartedAt?: number;
 
     /** Parent (job-level) AbortSignal. Forwarded from runCodeReview use-case
      *  via the strategy payload, then plumbed into AgentReviewStage so the
@@ -503,4 +563,31 @@ export const resolvedProvider = (
     return typeof provider === 'string' && provider.length > 0
         ? provider
         : undefined;
+};
+
+/**
+ * Whether an exhausted API quota is the org's to fix. True when the key that
+ * failed is the org's own: a BYOK slot (only those carry a `credentialId`), or
+ * on a self-hosted install the env-configured key (the installer owns it).
+ * False for the Kodus-managed default (cloud without BYOK, or self-hosted with
+ * no usable env key, which falls through to Kodus's funded default) and for a
+ * `kodus` credential, which is routed like a BYOK slot but calls Kodus's own
+ * upstream key, so running out there is ours.
+ *
+ * `err` is the failed call's error: after a cascade the provider that failed
+ * is the stamped attempt, not the slot resolved before the run.
+ */
+export const usesOrgOwnedKey = (
+    context: Pick<CodeReviewPipelineContext, 'codeReviewConfig'>,
+    err?: unknown,
+): boolean => {
+    if (isPlatformFundedProvider(resolvedProvider(context, err))) {
+        return false;
+    }
+
+    if (context.codeReviewConfig?.resolvedModelSlot?.credentialId) {
+        return true;
+    }
+
+    return !environment.API_CLOUD_MODE && resolveEnvProvider() !== null;
 };

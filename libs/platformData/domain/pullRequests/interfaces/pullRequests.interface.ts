@@ -6,6 +6,7 @@ import {
 
 import { DeliveryStatus } from '../enums/deliveryStatus.enum';
 import { ImplementationStatus } from '../enums/implementationStatus.enum';
+import type { ImplementationCheckRecord } from '../implementation-status';
 import { PriorityStatus } from '../enums/priorityStatus.enum';
 import { FeedbackType } from '@libs/platformData/domain/pullRequests/enums/feedbackType.enum';
 import { SeverityLevel } from '@libs/common/utils/enums/severityLevel.enum';
@@ -23,6 +24,71 @@ export interface IApprovalReasonDeliveryFailure {
     decision: 'hold' | 'approve';
     reason: string;
     occurredAt: string;
+    /** Snapshot whose approval was confirmed before the comment failed. */
+    reviewedHeadSha?: string;
+    reviewedBaseSha?: string;
+}
+
+/** A request as it is recorded, added to the ones on record. */
+export interface KodyChangeRequestRecord {
+    requestedAt: string;
+    commentIds: string[];
+    suggestionIds: string[];
+    findingComments: KodyChangeRequestFindingComment[];
+}
+
+/** Which review comment a finding behind the request was posted as. */
+export interface KodyChangeRequestFindingComment {
+    suggestionId: string;
+    commentId: string;
+}
+
+/** A suggestion behind Kody's change request, as the PR stores it. */
+export interface KodyChangeRequestFinding {
+    suggestionId: string;
+    commentId?: string;
+    implementationStatus?: unknown;
+}
+
+/**
+ * Kody's "changes requested" standing on a PR. Written when the request is
+ * made, so it can be taken back once the findings behind it are resolved,
+ * with or without an approval.
+ */
+export interface IKodyChangeRequest {
+    /** Of the latest request; a later one replaces it. */
+    requestedAt: string;
+    /** Review comments of the critical findings behind the request. */
+    commentIds: string[];
+    /**
+     * The critical findings themselves. Absent on requests recorded before
+     * it existed, which are judged by their comments alone.
+     */
+    suggestionIds?: string[];
+    /**
+     * The comment each finding was posted as, so a finding whose suggestion
+     * was never stored is still judged by its thread.
+     */
+    findingComments?: KodyChangeRequestFindingComment[];
+    /**
+     * Summary comments the host keeps open next to the request (a GitLab
+     * discussion, an Azure thread), resolved when it is withdrawn.
+     */
+    summaryCommentIds?: string[];
+}
+
+export interface IPullRequestWithKodyChangeRequest {
+    number: number;
+    provider: string;
+    repository: { id: string; name: string };
+    kodyChangeRequest: IKodyChangeRequest;
+}
+
+export interface ApprovalReasonDeliveryGuard {
+    /** Logical publication attempt time, captured before provider I/O. */
+    notAfter?: string;
+    /** Repair only the notice that was read, never a replacement. */
+    expectedFailure?: IApprovalReasonDeliveryFailure;
 }
 
 export interface SuggestionCountsBySeverity {
@@ -59,6 +125,7 @@ export interface SuggestionCountsBySeverity {
 export interface IPullRequests {
     uuid?: string;
     approvalReasonDeliveryFailure?: IApprovalReasonDeliveryFailure | null;
+    kodyChangeRequest?: IKodyChangeRequest;
     title: string;
     status: string;
     merged: boolean;
@@ -150,6 +217,8 @@ export interface ISuggestion {
     priorityStatus: PriorityStatus;
     deliveryStatus: DeliveryStatus;
     implementationStatus?: ImplementationStatus;
+    /** The last implementation check that looked at this suggestion. */
+    implementationCheck?: ImplementationCheckRecord;
     comment?: {
         id: number;
         pullRequestReviewId: number;
@@ -275,10 +344,12 @@ export interface IDeliveredSuggestion {
 
 export interface IPullRequestWithDeliveredSuggestions {
     _id: string;
+    approvalReasonDeliveryFailure?: IApprovalReasonDeliveryFailure | null;
     number: number;
     organizationId: string;
     status: string;
     provider: string;
+    url?: string;
     repository: {
         id: string;
         name: string;
@@ -295,3 +366,22 @@ export interface IPullRequestUserMapping {
     user: IPullRequestUser;
     organizationId: string;
 }
+
+export type UpdateSuggestionOptions = {
+    /** Writes the suggestion only while its stored status is none of these. */
+    implementationStatusNotIn?: ImplementationStatus[];
+    /** false: return only whether a suggestion was written, not the PR document. */
+    returnDocument?: boolean;
+    /** Values added, each once, to array fields of the suggestion (dotted paths), in the same write. */
+    addToSet?: Record<string, string[]>;
+    /** Fields of the suggestion (dotted paths) removed in the same write. */
+    unset?: string[];
+    /** The only paths of the PR document returned (e.g. `files.suggestions.id`); wins over `returnDocument: false`. */
+    projection?: string[];
+    /**
+     * The PR the suggestion belongs to, when the caller has it. The write then
+     * finds the document by `_id` instead of searching the organization's PRs
+     * for one that holds the suggestion id.
+     */
+    pullRequestId?: string;
+};

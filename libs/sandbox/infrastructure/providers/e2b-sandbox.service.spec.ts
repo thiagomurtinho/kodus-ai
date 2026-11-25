@@ -29,8 +29,10 @@ import { CommandExitError, Sandbox } from 'e2b';
 import {
     E2BSandboxService,
     buildE2BRemoteCommands,
+    fixedIpReasonFrom,
     syncE2BSandboxRepo,
 } from './e2b-sandbox.service';
+import { FixedEgressIpUnavailableError } from '@libs/sandbox/domain/egress-plan';
 import type { CreateSandboxParams } from '@libs/sandbox/domain/contracts/sandbox.provider';
 import { readWithinRootCommand } from './read-within-root';
 
@@ -208,6 +210,44 @@ describe('buildE2BRemoteCommands', () => {
                 .mockResolvedValue({ stdout: 'x', stderr: '', exitCode: 0 });
             const rc = buildE2BRemoteCommands(makeSandbox(run));
             await expect(rc.read('src/a.ts', 0, 0)).resolves.toBe('x');
+        });
+
+        it.each([
+            'app/[...slug]/page.tsx',
+            'app/(..)photo/page.tsx',
+            'src/foo..bar.ts',
+        ])('reads %p, whose ".." is part of a file name', async (routePath) => {
+            const run = jest
+                .fn()
+                .mockResolvedValue({ stdout: 'x', stderr: '', exitCode: 0 });
+            const rc = buildE2BRemoteCommands(makeSandbox(run));
+            await expect(rc.read(routePath, 0, 0)).resolves.toBe('x');
+            await expect(rc.grep('x', routePath)).resolves.toBe('x');
+        });
+
+        it.each(['a/../../secret', '..\\secret', 'app/[...slug]/../../x'])(
+            'rejects %p, which has a ".." segment',
+            async (escapePath) => {
+                const run = jest.fn();
+                const rc = buildE2BRemoteCommands(makeSandbox(run));
+                await expect(rc.read(escapePath, 0, 0)).rejects.toThrow(
+                    'Path traversal using ".." is not allowed',
+                );
+                expect(run).not.toHaveBeenCalled();
+            },
+        );
+
+        it('reads under a linked root whose name holds ".."', async () => {
+            const run = jest
+                .fn()
+                .mockResolvedValue({ stdout: 'x', stderr: '', exitCode: 0 });
+            const rc = buildE2BRemoteCommands(makeSandbox(run));
+            await expect(
+                rc.read('src/a.ts', 0, 0, '/home/user/_linked/acme_shop..web'),
+            ).resolves.toBe('x');
+            await expect(
+                rc.read('src/a.ts', 0, 0, '/home/user/_linked/../repo'),
+            ).rejects.toThrow('Not a repository root of this sandbox');
         });
     });
 
@@ -1173,5 +1213,560 @@ describe('E2BSandboxService.installDependencies', () => {
             expect.stringContaining('apt-get install'),
             { timeoutMs: 300_000, user: 'root' },
         );
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Egress route: direct for teams whose Git host does not need our fixed IP
+// ---------------------------------------------------------------------------
+describe('E2BSandboxService egress route', () => {
+    const { PRIVILEGES_DROPPED_MARKER } = jest.requireActual(
+        './review-user-privileges',
+    );
+    const ORG = '11111111-1111-4111-8111-111111111111';
+    const TEAM = '22222222-2222-4222-8222-222222222222';
+    const IP_BLOCK =
+        "remote: the `acme` organization has an IP allow list enabled, and your IP address is not permitted to access this resource.\nfatal: unable to access 'https://github.com/acme/api.git/': The requested URL returned error: 403";
+
+    const exitError = (stderr: string, exitCode = 128) =>
+        new (CommandExitError as any)({ stdout: '', stderr, exitCode });
+
+    /**
+     * A sandbox whose network starts on the egress proxy, as the template
+     * boots it. `onProxy` follows the iptables commands the service runs.
+     */
+    const fakeSandbox = (opts: {
+        directClone?:
+            'ok' | 'refused' | 'bad-credentials' | 'no-repo-permission' | 'dns';
+        proxyClone?: 'ok' | 'fails';
+        reachable?: boolean;
+        reachCheck?: 'sandbox-error';
+        cannotLeaveProxy?: boolean;
+    }) => {
+        const log: { cmd: string; user?: string; onProxy: boolean }[] = [];
+        let onProxy = true;
+        const run = jest.fn(async (cmd: string, o?: { user?: string }) => {
+            log.push({ cmd, user: o?.user, onProxy });
+            if (cmd.includes('gpasswd')) {
+                return {
+                    stdout: `${PRIVILEGES_DROPPED_MARKER}\n`,
+                    stderr: '',
+                    exitCode: 0,
+                };
+            }
+            if (cmd.includes('iptables -t nat -I OUTPUT 1')) {
+                if (opts.cannotLeaveProxy) throw exitError('denied', 1);
+                onProxy = false;
+            } else if (cmd.includes('iptables -t nat -A OUTPUT')) {
+                onProxy = true;
+            } else if (cmd.includes('/dev/tcp/')) {
+                if (opts.reachCheck === 'sandbox-error') {
+                    throw new Error('sandbox API unavailable');
+                }
+                if (opts.reachable === false) throw exitError('', 124);
+            } else if (cmd.includes('git init')) {
+                const outcome = onProxy
+                    ? (opts.proxyClone ?? 'ok')
+                    : (opts.directClone ?? 'ok');
+                if (outcome === 'bad-credentials') {
+                    throw exitError(
+                        "fatal: Authentication failed for 'https://github.com/acme/api.git/'",
+                    );
+                }
+                if (outcome === 'no-repo-permission') {
+                    throw exitError(
+                        "remote: Write access to repository not granted.\nfatal: unable to access 'https://github.com/acme/api.git/': The requested URL returned error: 403",
+                    );
+                }
+                if (outcome === 'dns') {
+                    throw exitError(
+                        "fatal: unable to access 'https://github.com/acme/api.git/': Could not resolve host: github.com",
+                    );
+                }
+                if (outcome !== 'ok') throw exitError(IP_BLOCK);
+            }
+            return { stdout: '', stderr: '', exitCode: 0 };
+        });
+        const sbx = {
+            sandboxId: 'sbx-1',
+            commands: { run },
+            kill: jest.fn(),
+            files: { read: jest.fn(), write: jest.fn() },
+        };
+        return { sbx, log };
+    };
+
+    type Fallback = 'allowed' | 'plan' | 'turned_off' | 'throws';
+    const policy = (
+        route: 'direct' | 'fixed_ip',
+        fallback: Fallback,
+        why = route === 'direct' ? 'not_marked' : 'marked',
+    ) => ({
+        route: jest.fn().mockResolvedValue(route),
+        decide:
+            why === 'throws'
+                ? jest.fn().mockRejectedValue(new Error('pg down'))
+                : jest.fn().mockResolvedValue({ route, why }),
+        fixedIpAllowed: jest.fn().mockResolvedValue(fallback !== 'plan'),
+        fixedIpFallback:
+            fallback === 'throws'
+                ? jest.fn().mockRejectedValue(new Error('billing down'))
+                : jest.fn().mockResolvedValue(fallback),
+        markFixedIpRequired: jest.fn().mockResolvedValue(undefined),
+        getFixedIpSetting: jest.fn(),
+        setFixedIp: jest.fn(),
+    });
+
+    const create = async (opts: {
+        route: 'direct' | 'fixed_ip';
+        sandbox?: Parameters<typeof fakeSandbox>[0];
+        template?: boolean;
+        scoped?: boolean;
+        gitProxyMisconfigured?: boolean;
+        /** The organization's plan includes the fixed IP (default: yes). */
+        paidPlan?: boolean;
+        /** What the policy answers after a failed direct clone. */
+        fallback?: Fallback;
+        /** Why the policy picked the route (default follows the route);
+         * `throws` makes the decision itself fail. */
+        why?: string;
+        /** Overrides the organization and team the sandbox is created for. */
+        scopeOverride?: { organizationId?: string; teamId?: string };
+    }) => {
+        const { sbx, log } = fakeSandbox(opts.sandbox ?? {});
+        (Sandbox as any).create = jest.fn().mockResolvedValue(sbx);
+        const config = {
+            get: (key: string) =>
+                ({
+                    API_E2B_KEY: 'key',
+                    API_NODE_ENV: 'test',
+                    ...(opts.template !== false && {
+                        API_E2B_TEMPLATE_ID: 'tpl',
+                    }),
+                    // setupProxy throws: host without password.
+                    ...(opts.gitProxyMisconfigured && {
+                        E2B_PROXY_HOST: '192.0.2.1',
+                    }),
+                })[key],
+        };
+        const egress = policy(
+            opts.route,
+            opts.fallback ?? (opts.paidPlan === false ? 'plan' : 'allowed'),
+            opts.why,
+        );
+        const service = new E2BSandboxService(config as any, egress);
+        const logged = jest.fn();
+        const realLogger = (service as any).logger;
+        (service as any).logger = new Proxy(realLogger, {
+            get: (target, prop) =>
+                prop === 'log' || prop === 'warn'
+                    ? (entry: unknown) => {
+                          logged(entry);
+                          return target[prop](entry);
+                      }
+                    : target[prop],
+        });
+        const result = service.createSandboxWithRepo({
+            cloneUrl: 'https://github.com/acme/api.git',
+            authToken: 'tok',
+            branch: 'feature',
+            prNumber: 1,
+            platform: PlatformType.GITHUB,
+            sandboxMetadata: { stage: 'review' },
+            ...(opts.scoped !== false && { organizationId: ORG, teamId: TEAM }),
+            ...opts.scopeOverride,
+        });
+        return { result, egress, log, sbx, logged };
+    };
+
+    /** The one `[egress] route=` line the sandbox wrote. */
+    const routeLines = (logged: jest.Mock) =>
+        logged.mock.calls
+            .map(([entry]) => entry as { message: string; metadata: any })
+            .filter((e) => e.message?.startsWith('[egress] route='));
+
+    const clones = (log: { cmd: string; onProxy: boolean }[]) =>
+        log.filter((l) => l.cmd.includes('git init'));
+    const touchesNetwork = (log: { cmd: string }[]) =>
+        log.some((l) => l.cmd.includes('iptables'));
+
+    it('leaves the network alone for a team that needs the fixed IP', async () => {
+        const { result, log, egress } = await create({ route: 'fixed_ip' });
+        await result;
+        expect(egress.decide).toHaveBeenCalledWith({
+            organizationId: ORG,
+            teamId: TEAM,
+        });
+        expect(touchesNetwork(log)).toBe(false);
+        expect(clones(log)).toHaveLength(1);
+    });
+
+    it('takes the sandbox off the proxy, as root, before the repository is cloned', async () => {
+        const { result, log, egress } = await create({ route: 'direct' });
+        await result;
+        const leave = log.findIndex((l) =>
+            l.cmd.includes('iptables -t nat -I OUTPUT 1'),
+        );
+        const clone = log.findIndex((l) => l.cmd.includes('git init'));
+        expect(leave).toBeGreaterThanOrEqual(0);
+        expect(log[leave].user).toBe('root');
+        expect(leave).toBeLessThan(clone);
+        expect(clones(log)).toEqual([
+            expect.objectContaining({ onProxy: false }),
+        ]);
+        expect(egress.markFixedIpRequired).not.toHaveBeenCalled();
+    });
+
+    it('clones through the fixed IP and marks the team when the Git host refuses the direct clone', async () => {
+        const { result, log, egress, sbx } = await create({
+            route: 'direct',
+            sandbox: { directClone: 'refused' },
+        });
+        const instance = await result;
+        expect(instance.sandboxId).toBe('sbx-1');
+        expect(sbx.kill).not.toHaveBeenCalled();
+        expect(clones(log).map((c) => c.onProxy)).toEqual([false, true]);
+        expect(egress.markFixedIpRequired).toHaveBeenCalledWith(
+            { organizationId: ORG, teamId: TEAM },
+            'ip_allow_list',
+        );
+    });
+
+    it('goes back to the fixed IP before cloning when the Git host cannot be reached direct', async () => {
+        const { result, log, egress } = await create({
+            route: 'direct',
+            sandbox: { reachable: false },
+        });
+        await result;
+        expect(clones(log).map((c) => c.onProxy)).toEqual([true]);
+        expect(egress.markFixedIpRequired).toHaveBeenCalledWith(
+            { organizationId: ORG, teamId: TEAM },
+            'unreachable',
+        );
+    });
+
+    it('clones direct when the reachability check itself could not run: that proves nothing', async () => {
+        const { result, log, egress } = await create({
+            route: 'direct',
+            sandbox: { reachCheck: 'sandbox-error' },
+        });
+        await result;
+        expect(clones(log).map((c) => c.onProxy)).toEqual([false]);
+        expect(egress.markFixedIpRequired).not.toHaveBeenCalled();
+    });
+
+    it('still clones through the fixed IP when the git-only proxy setup fails on the way back', async () => {
+        const { result, log, egress, sbx } = await create({
+            route: 'direct',
+            sandbox: { directClone: 'refused' },
+            gitProxyMisconfigured: true,
+        });
+        const instance = await result;
+        expect(instance.sandboxId).toBe('sbx-1');
+        expect(sbx.kill).not.toHaveBeenCalled();
+        expect(clones(log).map((c) => c.onProxy)).toEqual([false, true]);
+        expect(egress.markFixedIpRequired).toHaveBeenCalled();
+    });
+
+    it('marks nothing when the clone fails on the fixed IP too: that is not an egress problem', async () => {
+        const { result, egress } = await create({
+            route: 'direct',
+            sandbox: { directClone: 'refused', proxyClone: 'fails' },
+        });
+        await expect(result).rejects.toBeDefined();
+        expect(egress.markFixedIpRequired).not.toHaveBeenCalled();
+    });
+
+    it('stays on the fixed IP when the sandbox cannot be taken off the proxy', async () => {
+        const { result, log, egress } = await create({
+            route: 'direct',
+            sandbox: { cannotLeaveProxy: true },
+        });
+        await result;
+        expect(clones(log).map((c) => c.onProxy)).toEqual([true]);
+        expect(log.some((l) => l.cmd.includes('/dev/tcp/'))).toBe(false);
+        expect(egress.markFixedIpRequired).not.toHaveBeenCalled();
+    });
+
+    it('never sends a team whose plan has no fixed IP back to the proxy when its Git host refuses the direct clone', async () => {
+        const { result, log, egress } = await create({
+            route: 'direct',
+            paidPlan: false,
+            sandbox: { directClone: 'refused' },
+        });
+        const error = await result.catch((e) => e);
+        expect(error).toBeInstanceOf(FixedEgressIpUnavailableError);
+        expect(error.message).toContain('Teams and Enterprise');
+        expect(error.message).toContain('only accepts allowlisted IPs');
+        expect(error.message).not.toMatch(
+            /ip_allow_list|unreachable|forbidden/,
+        );
+        expect(error.reason).toBe('ip_allow_list');
+        expect(error.blockedBy).toBe('plan');
+        expect(clones(log).map((c) => c.onProxy)).toEqual([false]);
+        expect(
+            log.some((l) => l.cmd.includes('iptables -t nat -A OUTPUT')),
+        ).toBe(false);
+        expect(egress.markFixedIpRequired).not.toHaveBeenCalled();
+    });
+
+    it('tells a team whose plan has no fixed IP why, when its Git host cannot be reached direct', async () => {
+        const { result, log } = await create({
+            route: 'direct',
+            paidPlan: false,
+            sandbox: { reachable: false },
+        });
+        const error = await result.catch((e) => e);
+        expect(error).toBeInstanceOf(FixedEgressIpUnavailableError);
+        expect(error.reason).toBe('unreachable');
+        expect(clones(log)).toHaveLength(0);
+    });
+
+    it('gives a team whose plan has no fixed IP the clone error itself when it does not look like a firewall', async () => {
+        const { result } = await create({
+            route: 'direct',
+            paidPlan: false,
+            sandbox: { directClone: 'bad-credentials' },
+        });
+        const error = await result.catch((e) => e);
+        expect(error).not.toBeInstanceOf(FixedEgressIpUnavailableError);
+        expect(String(error?.stderr ?? error?.message)).toContain(
+            'Authentication failed',
+        );
+    });
+
+    it('respects a team that turned the fixed IP off by hand, and says how to turn it on', async () => {
+        const { result, log, egress } = await create({
+            route: 'direct',
+            fallback: 'turned_off',
+            sandbox: { directClone: 'refused' },
+        });
+        const error = await result.catch((e) => e);
+        expect(error).toBeInstanceOf(FixedEgressIpUnavailableError);
+        expect(error.blockedBy).toBe('turned_off');
+        expect(error.message).toContain('Organization settings > General');
+        expect(clones(log).map((c) => c.onProxy)).toEqual([false]);
+        expect(egress.markFixedIpRequired).not.toHaveBeenCalled();
+    });
+
+    it('retries through the fixed IP and marks the team when the policy cannot answer', async () => {
+        const { result, log, egress } = await create({
+            route: 'direct',
+            fallback: 'throws',
+            sandbox: { directClone: 'refused' },
+        });
+        await result;
+        expect(clones(log).map((c) => c.onProxy)).toEqual([false, true]);
+        expect(egress.markFixedIpRequired).toHaveBeenCalledWith(
+            { organizationId: ORG, teamId: TEAM },
+            'ip_allow_list',
+        );
+    });
+
+    it("gives a team whose plan has no fixed IP git's own 403 when it is not the IP allow list", async () => {
+        const { result } = await create({
+            route: 'direct',
+            paidPlan: false,
+            sandbox: { directClone: 'no-repo-permission' },
+        });
+        const error = await result.catch((e) => e);
+        expect(error).not.toBeInstanceOf(FixedEgressIpUnavailableError);
+        expect(String(error?.stderr)).toContain(
+            'Write access to repository not granted',
+        );
+    });
+
+    it("gives a team whose plan has no fixed IP git's own error when the host name does not resolve", async () => {
+        const { result } = await create({
+            route: 'direct',
+            paidPlan: false,
+            sandbox: { directClone: 'dns' },
+        });
+        const error = await result.catch((e) => e);
+        expect(error).not.toBeInstanceOf(FixedEgressIpUnavailableError);
+        expect(String(error?.stderr)).toContain('Could not resolve host');
+    });
+
+    it('keeps the fixed IP, without asking, for a sandbox that does not say which team it serves', async () => {
+        const { result, log, egress } = await create({
+            route: 'direct',
+            scoped: false,
+        });
+        await result;
+        expect(egress.decide).not.toHaveBeenCalled();
+        expect(touchesNetwork(log)).toBe(false);
+    });
+
+    it('does not ask without the template: there is no proxy to take the sandbox off', async () => {
+        const { result, egress } = await create({
+            route: 'direct',
+            template: false,
+        });
+        await result;
+        expect(egress.decide).not.toHaveBeenCalled();
+    });
+
+    it('logs one route line per sandbox with the organization, the team and why', async () => {
+        const { result, logged } = await create({ route: 'direct' });
+        await result;
+        expect(routeLines(logged)).toEqual([
+            expect.objectContaining({
+                message: '[egress] route=direct (not_marked)',
+                metadata: expect.objectContaining({
+                    organizationId: ORG,
+                    teamId: TEAM,
+                    route: 'direct',
+                    why: 'not_marked',
+                }),
+            }),
+        ]);
+    });
+
+    it("logs the policy's own reason, not one read off the route", async () => {
+        for (const [route, why] of [
+            ['fixed_ip', 'rollout_off'],
+            ['direct', 'not_in_plan'],
+        ] as const) {
+            const { result, logged } = await create({ route, why });
+            await result;
+            expect(routeLines(logged)).toEqual([
+                expect.objectContaining({
+                    message: `[egress] route=${route} (${why})`,
+                    metadata: expect.objectContaining({ route, why }),
+                }),
+            ]);
+        }
+    });
+
+    it('logs the fixed IP with the reason when the sandbox cannot be taken off the proxy', async () => {
+        const { result, logged } = await create({
+            route: 'direct',
+            sandbox: { cannotLeaveProxy: true },
+        });
+        await result;
+        expect(routeLines(logged)).toEqual([
+            expect.objectContaining({
+                message: '[egress] route=fixed_ip (bypass_failed)',
+            }),
+        ]);
+        expect(logged).toHaveBeenCalledWith(
+            expect.objectContaining({
+                message: expect.stringContaining(
+                    'could not take the sandbox off the egress proxy',
+                ),
+                metadata: expect.objectContaining({
+                    organizationId: ORG,
+                    teamId: TEAM,
+                }),
+            }),
+        );
+    });
+
+    it('keeps the fixed IP, and says so, when the route decision itself fails', async () => {
+        const { result, logged, log } = await create({
+            route: 'direct',
+            why: 'throws',
+        });
+        await result;
+        expect(touchesNetwork(log)).toBe(false);
+        expect(routeLines(logged)).toEqual([
+            expect.objectContaining({
+                message: '[egress] route=fixed_ip (policy_failed)',
+            }),
+        ]);
+    });
+
+    it('decides nothing for a sandbox with an organization but no team, nor a team but no organization', async () => {
+        for (const scopeOverride of [
+            { teamId: undefined },
+            { organizationId: undefined },
+        ]) {
+            const { result, logged, egress, log } = await create({
+                route: 'direct',
+                scopeOverride,
+            });
+            await result;
+            expect(egress.decide).not.toHaveBeenCalled();
+            expect(touchesNetwork(log)).toBe(false);
+            expect(routeLines(logged)).toEqual([
+                expect.objectContaining({
+                    message: '[egress] route=fixed_ip (no_scope)',
+                }),
+            ]);
+        }
+    });
+
+    it('warns about the proxy only when the sandbox could not leave it', async () => {
+        const { result, logged } = await create({ route: 'direct' });
+        await result;
+        expect(logged).not.toHaveBeenCalledWith(
+            expect.objectContaining({
+                message: expect.stringContaining(
+                    'could not take the sandbox off the egress proxy',
+                ),
+            }),
+        );
+    });
+
+    it('logs why a sandbox without the template keeps the fixed IP', async () => {
+        const { result, logged } = await create({
+            route: 'direct',
+            template: false,
+        });
+        await result;
+        expect(routeLines(logged)).toEqual([
+            expect.objectContaining({
+                message: '[egress] route=fixed_ip (no_template)',
+            }),
+        ]);
+    });
+
+    it('never tells the sandbox provider which organization or team it serves', async () => {
+        const { result } = await create({ route: 'direct' });
+        await result;
+        const metadata = JSON.stringify(
+            (Sandbox as any).create.mock.calls[0][1].metadata,
+        );
+        expect(metadata).not.toContain(ORG);
+        expect(metadata).not.toContain(TEAM);
+    });
+});
+
+describe('fixedIpReasonFrom', () => {
+    const exitError = (stderr: string) =>
+        new (CommandExitError as any)({ stdout: '', stderr, exitCode: 128 });
+
+    it('reads a GitHub IP allow list refusal', () => {
+        expect(
+            fixedIpReasonFrom(
+                exitError('the org has an IP allow list enabled'),
+            ),
+        ).toBe('ip_allow_list');
+    });
+
+    it('reads a 403 without an allow list message as forbidden', () => {
+        expect(
+            fixedIpReasonFrom(
+                exitError(
+                    "fatal: unable to access 'https://gitlab.acme.test/x.git/': The requested URL returned error: 403",
+                ),
+            ),
+        ).toBe('forbidden');
+    });
+
+    it('reads a connection that never got through as unreachable', () => {
+        expect(
+            fixedIpReasonFrom(
+                new Error(
+                    'Git clone failed: Failed to connect to git.acme.test port 443: Connection timed out',
+                ),
+            ),
+        ).toBe('unreachable');
+    });
+
+    it('calls anything else other', () => {
+        expect(
+            fixedIpReasonFrom(exitError("fatal: couldn't find remote ref")),
+        ).toBe('other');
     });
 });

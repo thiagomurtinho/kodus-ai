@@ -10,6 +10,7 @@ import { DeleteIntegrationUseCase } from './delete-integration.use-case';
 import { FinishOnboardingUseCase } from './finish-onboarding.use-case';
 import { GetCodeManagementMemberListUseCase } from './get-code-management-members-list.use-case';
 import { GetCurrentCodeManagementUserUseCase } from './get-current-code-management-user.use-case';
+import { GetMemberLabelsUseCase } from './get-member-labels.use-case';
 import { GetPRsByRepoUseCase } from './get-prs-repo.use-case';
 import { GetPRsUseCase } from './get-prs.use-case';
 import { GetRepositoriesUseCase } from './get-repositories';
@@ -22,10 +23,21 @@ import { ReceiveWebhookUseCase } from './receiveWebhook.use-case';
 import { SearchCodeManagementUsersUseCase } from './search-code-management-users.use-case';
 import { TriggerBusinessValidationUseCase } from './trigger-business-validation.use-case';
 import { UpdateAutoLicenseAllowedUsersUseCase } from './update-auto-license-allowed-users.use-case';
+import {
+    GetRepositorySelectionUseCase,
+    PreviewAllRepositoriesUseCase,
+    SetRepositorySelectionUseCase,
+} from './repository-selection.use-cases';
+import { SyncAllRepositoriesUseCase } from './sync-all-repositories.use-case';
+import {
+    GetFixedEgressIpUseCase,
+    SetFixedEgressIpUseCase,
+} from './egress-fixed-ip.use-cases';
 
 export default [
     CarryReviewCheckToMergeQueueUseCase,
     GetCodeManagementMemberListUseCase,
+    GetMemberLabelsUseCase,
     CreateIntegrationUseCase,
     CreateRepositoriesUseCase,
     BackfillAstGraphBuildUseCase,
@@ -48,4 +60,10 @@ export default [
     UpdateAutoLicenseAllowedUsersUseCase,
     PruneRemovedLicenseSeatsUseCase,
     AutoRevokeRemovedLicenseSeatsUseCase,
+    SyncAllRepositoriesUseCase,
+    GetRepositorySelectionUseCase,
+    SetRepositorySelectionUseCase,
+    PreviewAllRepositoriesUseCase,
+    GetFixedEgressIpUseCase,
+    SetFixedEgressIpUseCase,
 ];

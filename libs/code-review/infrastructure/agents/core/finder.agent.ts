@@ -14,6 +14,7 @@ import type {
     AgentSpec,
 } from '@libs/agent-harness/domain/contracts/agent.contract';
 import type { Compressor } from '@libs/agent-harness/domain/contracts/compression.contract';
+import type { AgentPolicy } from '@libs/agent-harness/domain/contracts/policy.contract';
 import type { ProgressLedger } from '@libs/agent-harness/domain/contracts/progress.contract';
 import type {
     RunState,
@@ -35,6 +36,8 @@ import { LlmVerifier } from '@libs/code-review/infrastructure/agents/core/verifi
 import { ConventionVerifier } from '@libs/code-review/infrastructure/agents/core/convention-verifier.agent';
 import {
     checkConventionQuotes,
+    isCodeFileSource,
+    checkCodeFileQuotes,
     isTeamSystemSource,
     isToolSource,
     isProvenByAstGrep,
@@ -759,6 +762,9 @@ export interface RunFinderWithVerifyParams {
     verifyFallbackModelId?: string;
     /** Provider options built for `verifyRunner`'s model. */
     verifyProviderOptions?: Readonly<Record<string, unknown>>;
+    /** The window guard for `verifyRunner`'s model, sized to its own window:
+     *  the finder's would budget a different model (#2233). */
+    verifyCompressor?: Compressor;
     /** Verify concurrency (default 4). */
     concurrency?: number;
     /** Provider options (reasoning/thinking config) forwarded to verifier runs. */
@@ -815,6 +821,27 @@ export interface HeavyLensRunResult {
     usage: VerifyUsage;
     passStats: RecallPassStat[];
     investigatedFiles: Set<string>;
+    /** How each lens ended, failed ones included: what the PR timeline shows. */
+    outcomes: HeavyLensOutcome[];
+}
+
+/** How one lens ended. A provider error does not reject the run: the runner
+ *  returns it as an error-status state, so this reads the state. */
+export interface HeavyLensOutcome {
+    /** The pass label, `lens-<id>`; findings carry it in `producedBy`. */
+    label: string;
+    status: 'success' | 'failed' | 'no-result';
+    /** Findings the lens returned, before verify. */
+    found: number;
+    ms: number;
+    steps: number;
+    toolCalls: number;
+    error?: {
+        message?: string;
+        name?: string;
+        status?: number;
+        responseBody?: string;
+    };
 }
 
 /** Runs heavy mode's lenses on the finder's runner. */
@@ -842,6 +869,10 @@ export interface ConventionCheckParams {
     /** The custom agent's instructions: a rule cited from `TeamInstructions`
      *  is checked against them. */
     teamInstructions?: string;
+    /** The coding-agent instruction files the review loaded for this PR
+     *  (repository instructions): a rule quoted from one of them is checked
+     *  against the text the agent read. */
+    instructionFiles?: ReadonlyArray<{ path: string; content: string }>;
     /** What the ast-grep tool returned during this review (see
      *  recordAstGrepOutputs). Absent → no finding is proven by ast-grep. */
     astGrepLog?: AstGrepOutputLog;
@@ -901,6 +932,8 @@ export interface FinderWithVerifyResult {
     /** Per-pass stats (the base pass and the synthesis rescue), so a pass
      *  that pays for itself can be told from one that doesn't. */
     passStats: RecallPassStat[];
+    /** How each heavy-mode lens ended. Absent when the review ran no lenses. */
+    lensOutcomes?: HeavyLensOutcome[];
 }
 
 export const ZERO_VERIFY_USAGE: VerifyUsage = {
@@ -1056,6 +1089,7 @@ export async function runFinderWithVerify(
             verifyUsage: ZERO_VERIFY_USAGE,
             recallUsage,
             passStats,
+            ...(lensResult && { lensOutcomes: lensResult.outcomes }),
         };
     }
 
@@ -1100,6 +1134,14 @@ export async function runFinderWithVerify(
     const hv2 = await verifyFindings(
         {
             ...params,
+            // A verify run reads and re-sends files on up to ten steps
+            // (#2233): the check model's own window guard when the caller
+            // built one, else the finder's.
+            compression: params.verifyCompressor
+                ? new CompressionPolicy(params.verifyCompressor)
+                : params.finderSpec.policies.find(
+                      (p) => p.name === 'compression',
+                  ),
             runner: verify.runner,
             modelId: verify.modelId,
             fallbackModelId: verify.fallbackModelId,
@@ -1219,6 +1261,7 @@ export async function runFinderWithVerify(
         verifyMs,
         recallUsage,
         passStats,
+        ...(lensResult && { lensOutcomes: lensResult.outcomes }),
     };
 }
 
@@ -1244,7 +1287,10 @@ export async function verifyFindings(
         | 'repoInstructions'
         | 'checksInstructionCitations'
         | 'laneFocus'
-    >,
+    > & {
+        /** The finder's compression, for every verify run (#2233). */
+        compression?: AgentPolicy;
+    },
     suggestions: FinderSuggestion[],
     investigated: Set<string>,
     ctx: ToolContext,
@@ -1315,6 +1361,7 @@ export async function verifyFindings(
     // evidence gate below re-verifies at the full depth.
     const verifier = new LlmVerifier(params.runner, {
         modelId: params.modelId,
+        compression: params.compression,
         fallbackModelId: params.fallbackModelId,
         tools: params.tools,
         providerOptions: params.providerOptions,
@@ -1350,6 +1397,7 @@ export async function verifyFindings(
     if (unevidenced.length > 0) {
         const fullVerifier = new LlmVerifier(params.runner, {
             modelId: params.modelId,
+            compression: params.compression,
             fallbackModelId: params.fallbackModelId,
             tools: params.tools,
             forceFull: true,
@@ -1446,56 +1494,58 @@ async function routeByKind(
     sectionOf: Map<FinderSuggestion, string>;
     rejected: ConventionCheckRejected[];
 }> {
-    // A "convention" sourced from a tool's output (e.g. a CLI) or from a
-    // record in one of the team's systems quotes no rule, so the quote gate
-    // would drop it: it is checked as a bug instead.
-    const notAGuide = (s: FinderSuggestion) =>
+    // A "convention" sourced from a tool's output (e.g. a CLI), from a
+    // record in one of the team's systems or from a code file (a line shown
+    // as the pattern to follow) quotes no rule, so the quote gate would drop
+    // it: it is checked as a bug instead, a code file only when the quoted
+    // pattern is in it on the target branch.
+    const fromToolOrSystem = (s: FinderSuggestion) =>
         isToolSource(s, check.guideFiles) ||
         isTeamSystemSource(s, teamSystemTools);
-    const toolSourced = suggestions.filter(
-        (s) => s.kind === 'convention' && notAGuide(s),
+    const fromCode = (s: FinderSuggestion) =>
+        !fromToolOrSystem(s) &&
+        isCodeFileSource(s, check.guideFiles, check.teamInstructions);
+    const conventions = suggestions.filter((s) => s.kind === 'convention');
+    // The pattern a code-file citation shows must be in that file.
+    const code = await checkCodeFileQuotes(
+        conventions.filter(fromCode),
+        check.readGuide,
     );
     const bugs = [
         ...suggestions.filter((s) => s.kind !== 'convention'),
-        ...toolSourced.map((s) => ({
-            ...s,
-            kind: 'bug' as const,
-            source: undefined,
-        })),
+        ...[...conventions.filter(fromToolOrSystem), ...code.passed].map(
+            (s) => ({ ...s, kind: 'bug' as const, source: undefined }),
+        ),
     ];
-    const candidates = suggestions.filter(
-        (s) => s.kind === 'convention' && !notAGuide(s),
+    const candidates = conventions.filter(
+        (s) => !fromToolOrSystem(s) && !fromCode(s),
     );
-    if (candidates.length === 0) {
-        return {
-            bugs,
-            proven: [],
-            conventions: [],
-            sectionOf: new Map(),
-            rejected: [],
-        };
-    }
     const astGrepOutputs = check.astGrepLog?.outputs ?? [];
     const proven = candidates.filter((s) =>
         isProvenByAstGrep(s, astGrepOutputs),
     );
     const provenSet = new Set(proven);
-    const quoted = await checkConventionQuotes(
-        candidates.filter((s) => !provenSet.has(s)),
-        check.readGuide,
-        check.guideFiles ?? [],
-        check.listGuideDir,
-        check.teamInstructions,
-    );
-    if (quoted.rejected.length > 0) {
+    const unproven = candidates.filter((s) => !provenSet.has(s));
+    const quoted = unproven.length
+        ? await checkConventionQuotes(
+              unproven,
+              check.readGuide,
+              check.guideFiles ?? [],
+              check.listGuideDir,
+              check.teamInstructions,
+              check.instructionFiles,
+          )
+        : { passed: [], rejected: [] };
+    const rejected = [...code.rejected, ...quoted.rejected];
+    if (rejected.length > 0) {
         finderLogger.log({
-            message: `[quote-check] dropped ${quoted.rejected.length} convention finding(s) whose quote is not in the guide on the target branch`,
+            message: `[quote-check] dropped ${rejected.length} convention finding(s) whose quote is not in the guide on the target branch`,
             context: 'finder',
             serviceName: 'finder',
             metadata: {
                 ...logContext,
                 // Counts by why: the detail names the guide, never the quote.
-                byReason: quoted.rejected.reduce<Record<string, number>>(
+                byReason: rejected.reduce<Record<string, number>>(
                     (counts, r) => {
                         const why = quoteRejectReason(r.detail);
                         counts[why] = (counts[why] ?? 0) + 1;
@@ -1503,7 +1553,7 @@ async function routeByKind(
                     },
                     {},
                 ),
-                rejected: quoted.rejected.map((r) => ({
+                rejected: rejected.map((r) => ({
                     file: r.finding.relevantFile,
                     guide: r.finding.source?.file,
                     detail: r.detail,
@@ -1518,7 +1568,7 @@ async function routeByKind(
         sectionOf: new Map(
             quoted.passed.map((p) => [p.finding, p.sectionText]),
         ),
-        rejected: quoted.rejected,
+        rejected,
     };
 }
 
@@ -1526,6 +1576,8 @@ async function routeByKind(
  *  counts rejections by why. */
 function quoteRejectReason(detail: string): string {
     if (detail.startsWith('quote not found in ')) return 'quote not in guide';
+    if (detail.startsWith('quoted code not found in '))
+        return 'code not in cited file';
     if (detail.endsWith(' is not a guide linked to this review'))
         return 'guide not linked';
     if (detail.endsWith(' not found on the target branch'))

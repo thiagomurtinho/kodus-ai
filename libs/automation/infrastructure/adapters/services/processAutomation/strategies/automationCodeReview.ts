@@ -133,6 +133,7 @@ export class AutomationCodeReviewService implements Omit<
             triggerCommentId,
             reviewDirective,
             requestedReviewMode,
+            requestedReviewModeAccess,
             onlyCustomAgent,
             userGitId,
             signal,
@@ -334,6 +335,7 @@ export class AutomationCodeReviewService implements Omit<
                     reviewDirective, // @kody review <directive> steering text
                     requestedReviewMode, // @kody review --heavy / --balanced, over the mode in settings
                     onlyCustomAgent, // @kody -v <slug> — that custom agent only
+                    requestedReviewModeAccess, // whether that command's author can write
                 );
 
             await this._handleExecutionCompletion(
@@ -883,6 +885,37 @@ export class AutomationCodeReviewService implements Omit<
             typeof result.lastAnalyzedCommit === 'object' &&
             Object.keys(result.lastAnalyzedCommit).length > 0;
 
+        // Risk belongs to the assessed snapshot even if a later review stage
+        // fails before it can advance lastAnalyzedCommit.
+        if (result.riskAssessment) {
+            Object.assign(baseData, { riskAssessment: result.riskAssessment });
+        }
+        if (result.approvalPolicyEligibility) {
+            Object.assign(baseData, {
+                approvalPolicyEligibility: result.approvalPolicyEligibility,
+            });
+        }
+        if (result.approvalReviewSummary) {
+            Object.assign(baseData, {
+                approvalReviewSummary: result.approvalReviewSummary,
+            });
+        }
+
+        // What the approval cron needs to answer the same question the
+        // pipeline answered: a failed PR summary is partial but does not
+        // block approval (#2408). The handler computes it from the errors it
+        // saw; a result that does not carry it keeps reading as blocking.
+        if (typeof result.reviewApprovalBlocked === 'boolean') {
+            Object.assign(baseData, {
+                reviewApprovalBlocked: result.reviewApprovalBlocked,
+            });
+        }
+        if (result.customAgentRiskSkips?.length) {
+            Object.assign(baseData, {
+                customAgentRiskSkips: result.customAgentRiskSkips,
+            });
+        }
+
         if (validLastAnalyzedCommit) {
             Object.assign(baseData, {
                 lastAnalyzedCommit: result.lastAnalyzedCommit,
@@ -895,9 +928,25 @@ export class AutomationCodeReviewService implements Omit<
                 automaticReviewStatus: result.automaticReviewStatus,
                 approvalDecision: result.approvalDecision,
                 approvalRisk: result.approvalRisk,
-                // The mode it ran in: `--heavy` / `--balanced` asking for the
-                // other one re-reviews the whole PR.
+                // The mode it ran in: `--heavy` / `--balanced` / `--ultra`
+                // asking for another one re-reviews the whole PR.
                 heavy: !!result.heavy,
+                // Read by the Pull Requests screen (reviewModeOfExecution).
+                reviewMode: result.ultra
+                    ? 'ultra'
+                    : result.heavy
+                      ? 'heavy'
+                      : 'balanced',
+                reviewRoutingReason: result.reviewRoutingReason,
+                // Each Ultra model's outcome and the merge, kept with the
+                // execution. Already a record (ultraReviewRecord): no slots.
+                ...(result.ultra && { ultraReview: result.ultra }),
+            });
+        }
+
+        if (result.licenseNoticePostedAt) {
+            Object.assign(baseData, {
+                licenseNoticePostedAt: result.licenseNoticePostedAt,
             });
         }
 

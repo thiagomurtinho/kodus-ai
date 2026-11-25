@@ -11,6 +11,7 @@ export interface PullRequestReviewRun {
     url: string;
     repositoryName: string;
     repositoryId: string;
+    provider?: string;
     author?: { id: string; username: string; name?: string };
     suggestionsCount?: {
         sent: number;
@@ -19,6 +20,14 @@ export interface PullRequestReviewRun {
         categories?: string[];
     };
     reviewedCommitSha?: string;
+    recordedReviewedHeadSha?: string;
+    reviewMode?: 'balanced' | 'heavy';
+    reviewRoutingReason?: string;
+    approvalDecision?: {
+        kind: string;
+        reason: string;
+        matchedPolicy?: { name: string };
+    };
     executionId?: string;
     automationExecution?: {
         uuid: string;
@@ -33,16 +42,32 @@ export interface PullRequestReviewRun {
         stageName?: string;
         stageLabel?: string;
         message?: string | null;
+        metadata?: {
+            specialists?: Array<{
+                label: string;
+                status: string;
+                batchIndex?: number;
+                error?: string;
+            }>;
+        };
     }>;
     [key: string]: unknown;
 }
 
 export interface PullRequestExecutionsPage {
     data: PullRequestReviewRun[];
+    reviewIdentity?: {
+        repositoryId: string;
+        location: string;
+        provider?: string;
+    };
+    currentHeadSha?: string;
     pagination: {
         currentPage: number;
-        totalPages: number;
-        totalItems: number;
+        // Sent only on an empty result: the list no longer counts. Paging
+        // reads `nextCursor`.
+        totalPages?: number;
+        totalItems?: number;
         hasNextPage: boolean;
         nextCursor?: string;
     };
@@ -55,4 +80,5 @@ export interface PullRequestExecutionsQuery {
     pullRequestNumber: number;
     limit?: number;
     cursor?: string;
+    explain?: boolean;
 }

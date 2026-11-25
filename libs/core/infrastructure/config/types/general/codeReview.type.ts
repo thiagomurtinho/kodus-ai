@@ -1,4 +1,6 @@
 import { cliInstallProblem } from './cli-install';
+import type { RiskCriterion, RiskReviewRouting } from './risk-assessment';
+import type { NamedApprovalPolicy } from './approval-policies';
 import {
     cliBinaryExposureProblem,
     cliPrefixExposureProblem,
@@ -478,6 +480,8 @@ export const customAgentConfigSchema = z.object({
     id: z.string().min(1),
     name: z.string().min(1),
     enabled: z.boolean(),
+    /** Explicit commands bypass this automatic execution condition. */
+    runWhen: z.enum(['always', 'risk-found']).optional(),
     instructions: z.string().max(CUSTOM_AGENT_LIMITS.maxInstructionsLength),
     /** Globs over the changed files; the agent runs only when one matches. */
     scope: z.object({
@@ -825,14 +829,6 @@ export interface SuggestionControlConfig {
     };
 }
 
-export type ImplementedSuggestionsToAnalyze = {
-    id: string;
-    relevantFile: string;
-    language: string;
-    improvedCode: string;
-    existingCode: string;
-};
-
 /**
  * Business Logic settings as stored. Primitives and arrays only, so the
  * settings form tracks the level (global, repository, directory) per field.
@@ -865,19 +861,40 @@ export type BusinessLogicConfig = {
 
 /**
  * How deep a review goes. `balanced` (the default) runs the generalist;
- * `heavy` adds the M3 lenses and routes the `codeReviewHeavy` model. Both are
- * set in General settings. `fast` is only set by the CLI's `--fast`, and
+ * `heavy` adds the M3 lenses and routes the `codeReviewHeavy` model; `ultra`
+ * runs the heavy review on each of the org's three Ultra models and merges
+ * them (libs/ee/ultra-review). All three are set in settings. `fast` is only set by the CLI's `--fast`, and
  * `deep` by nothing today (#2367).
  */
-export type ReviewMode = 'fast' | 'balanced' | 'heavy' | 'deep';
+export type ReviewMode = 'fast' | 'balanced' | 'heavy' | 'ultra' | 'deep';
 
 /** The review modes a team can pick in settings or in kodus-config.yml. */
-export const SELECTABLE_REVIEW_MODES = ['balanced', 'heavy'] as const;
+export const SELECTABLE_REVIEW_MODES = ['balanced', 'heavy', 'ultra'] as const;
 
 export type CodeReviewConfig = {
     ignorePaths: string[];
     reviewMode?: ReviewMode;
+    /** Independent of automatic PR approval. */
+    riskAssessmentActive?: boolean;
+    riskCriteria?: RiskCriterion[];
+    riskReviewRouting?: RiskReviewRouting;
+    /** Runtime metadata; never a saved configuration choice. */
+    riskAssessmentMayBeActive?: boolean;
+    approvalSettingsMayVaryByDirectory?: boolean;
+    reviewSettingsError?: string;
+    approvalPolicySource?: 'legacy' | 'named';
+    riskAssessmentSource?: 'legacy' | 'independent';
     reviewOptions: ReviewOptions;
+
+    /**
+     * How Kody takes part in the conversation on a pull request (#2576).
+     * `implicitReplies: false` makes Kody answer an unmentioned reply in its
+     * own review thread only when someone writes `@kody`; the default keeps
+     * the classifier deciding, as it has since #1946.
+     */
+    conversation?: {
+        implicitReplies?: boolean;
+    };
 
     /** How the PR is checked against the task it references (Business Logic). */
     businessLogic?: BusinessLogicConfig;
@@ -911,6 +928,8 @@ export type CodeReviewConfig = {
     kodyMemoryRules?: Partial<IKodyRule>[];
     suggestionControl?: SuggestionControlConfig;
     pullRequestApprovalActive: boolean;
+    /** Ordered OR of enabled policies; each policy's conditions are AND. */
+    approvalPolicies?: NamedApprovalPolicy[];
     /** Optional approval scope. Each list is OR internally; both lists together require both matches. */
     approvalLabels?: string[];
     approvalAuthors?: string[];

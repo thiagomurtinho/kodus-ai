@@ -62,6 +62,7 @@ export const CUSTOM_AGENT_TEMPLATES = [
         instructions: [
             'Review the change against the architecture this repository already follows.',
             'Flag imports that cross a layer boundary the rest of the code respects, business logic placed in controllers or adapters, and new modules that duplicate one that already exists.',
+            'Dependencies point inward: domain or model code that imports from a controller, route handler, adapter, job, page or web framework, even only a type such as the request object, reverses that direction. A component built on the UI primitives follows it.',
             'Cite the file or doc that shows the existing pattern; do not flag style or naming.',
         ].join('\n'),
     },
@@ -202,6 +203,7 @@ export type AgentInput = {
     enabled?: boolean;
     /** Partial agent fields read from a JSON file, applied before the flags. */
     fromJson?: Partial<CustomAgent>;
+    runWhen?: string;
     linkSkills?: string[];
     linkDocs?: string[];
     unlink?: string[];
@@ -608,6 +610,7 @@ export function prepareAgentForSave(agent: CustomAgent): CustomAgent {
         name: agent.name,
         enabled: agent.enabled === true,
         instructions: agent.instructions ?? '',
+        ...(agent.runWhen !== undefined && { runWhen: agent.runWhen }),
         scope: {
             ...(include?.length && { include }),
             ...(exclude?.length && { exclude }),
@@ -715,6 +718,13 @@ export function applyAgentInput(
     }
     if (input.instructions !== undefined) {
         agent.instructions = input.instructions;
+    }
+    if (input.runWhen !== undefined || agent.runWhen !== undefined) {
+        agent.runWhen = oneOf(
+            input.runWhen ?? agent.runWhen,
+            ['always', 'risk-found'] as const,
+            '--run-when',
+        );
     }
     if (input.include !== undefined) {
         agent.scope = { ...agent.scope, include: input.include };

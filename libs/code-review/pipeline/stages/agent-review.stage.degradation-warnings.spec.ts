@@ -117,6 +117,22 @@ describe('AgentReviewStage — losses the run records (#2066)', () => {
         expect(warning.reason).toBe('sandbox_unavailable');
     });
 
+    it("says why there was no checkout when the Git host refused Kodus's shared network", async () => {
+        const { stage } = makeStage();
+        const cause =
+            'Kodus could not clone the repository from its shared network: your Git host only accepts allowlisted IPs. The fixed outbound IP is available on the Teams and Enterprise plans.';
+
+        const result = await run(
+            stage,
+            makeContext({ sandboxUnavailableDetail: cause }),
+        );
+
+        const warning = result.reviewWarnings.find(
+            (w: any) => w.kind === 'SANDBOX_UNAVAILABLE',
+        );
+        expect(warning.detail).toContain(cause);
+    });
+
     it('records a null sandbox (no provider) as a review without a checkout', async () => {
         const nullSandbox = {
             ...sandbox(),
@@ -177,6 +193,25 @@ describe('AgentReviewStage — losses the run records (#2066)', () => {
         );
 
         expect(kinds(result)).toEqual([]);
+    });
+});
+
+describe('AgentReviewStage — warnings recorded by earlier stages', () => {
+    it('keeps a DIFF_TRUNCATED recorded before it ran (#2206)', async () => {
+        const { stage } = makeStage();
+        const cut = {
+            kind: 'DIFF_TRUNCATED',
+            reason: 'patch_line_limit',
+            contextWindowTokens: 0,
+            modelName: '',
+            detail: '1 file diff(s) cut at 50000 lines, the rest was not reviewed: data/big.sql',
+        };
+
+        // No checkout, so this stage records a warning of its own too.
+        const result = await run(stage, makeContext({ reviewWarnings: [cut] }));
+
+        expect(result.reviewWarnings).toContainEqual(cut);
+        expect(kinds(result)).toContain('SANDBOX_UNAVAILABLE');
     });
 });
 

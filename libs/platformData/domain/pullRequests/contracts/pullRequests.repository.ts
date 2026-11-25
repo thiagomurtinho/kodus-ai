@@ -1,3 +1,8 @@
+import type {
+    UpdateSuggestionOptions,
+    KodyChangeRequestFinding,
+    KodyChangeRequestRecord,
+} from '@libs/platformData/domain/pullRequests/interfaces/pullRequests.interface';
 import { PullRequestState } from '@libs/core/domain/enums/pullRequestState.enum';
 import { Repository } from '@libs/core/infrastructure/config/types/general/codeReview.type';
 import { OrganizationAndTeamData } from '@libs/core/infrastructure/config/types/general/organizationAndTeamData';
@@ -6,15 +11,22 @@ import { PullRequestsEntity } from '../entities/pullRequests.entity';
 import { DeliveryStatus } from '../enums/deliveryStatus.enum';
 import {
     IApprovalReasonDeliveryFailure,
+    ApprovalReasonDeliveryGuard,
     IPullRequests,
     IFile,
     ISuggestion,
     ISuggestionByPR,
     IPullRequestWithDeliveredSuggestions,
+    IPullRequestWithKodyChangeRequest,
     IPullRequestUserMapping,
     SuggestionCountsBySeverity,
 } from '../interfaces/pullRequests.interface';
 
+import type {
+    CustomAgentFindingsScope,
+    CustomAgentSuggestionRow,
+    UnfollowedCitationRow,
+} from '@libs/platformData/domain/pullRequests/interfaces/custom-agent-findings.interface';
 export const PULL_REQUESTS_REPOSITORY_TOKEN = Symbol.for(
     'PullRequestsRepository',
 );
@@ -61,13 +73,25 @@ export interface BulkApplyResult {
 }
 
 export interface IPullRequestsRepository {
-    getNativeCollection(): any;
+    /**
+     * Each custom agent's stored findings (file and PR level) in one
+     * repository, one row per agent, pull request and statuses. Analytics
+     * read: off the primary, bounded.
+     */
+    findCustomAgentSuggestionRows(
+        scope: CustomAgentFindingsScope,
+    ): Promise<CustomAgentSuggestionRow[]>;
+    /** Dropped custom-agent findings that cited a file the agent does not follow. */
+    findUnfollowedCustomAgentCitations(
+        scope: CustomAgentFindingsScope,
+    ): Promise<UnfollowedCitationRow[]>;
 
     setApprovalReasonDeliveryFailure(
         organizationId: string,
         repositoryId: string,
         prNumber: number,
         failure: IApprovalReasonDeliveryFailure | null,
+        guard?: ApprovalReasonDeliveryGuard,
     ): Promise<boolean>;
 
     create(
@@ -77,6 +101,7 @@ export interface IPullRequestsRepository {
     findById(uuid: string): Promise<PullRequestsEntity | null>;
     findOne(
         filter?: Partial<IPullRequests>,
+        projection?: Record<string, 0 | 1>,
     ): Promise<PullRequestsEntity | null>;
     find(filter?: Partial<IPullRequests>): Promise<PullRequestsEntity[]>;
     findPRNumbersByTitleAndOrganization(
@@ -88,11 +113,13 @@ export interface IPullRequestsRepository {
         prNumber: number,
         repositoryName: string,
         organizationAndTeamData: OrganizationAndTeamData,
+        projection?: Record<string, 0 | 1>,
     ): Promise<PullRequestsEntity | null>;
     findByNumberAndRepositoryId(
         prNumber: number,
         repositoryId: string,
         organizationAndTeamData: OrganizationAndTeamData,
+        projection?: Record<string, 0 | 1>,
     ): Promise<PullRequestsEntity | null>;
     findByNumberAndRepositoryIdOptimized(
         prNumber: number,
@@ -146,6 +173,29 @@ export interface IPullRequestsRepository {
         organizationId: string,
         repositoryIds?: string[],
     ): Promise<Array<{ number: number; repositoryId: string }>>;
+    findPullRequestAuthorsOpenedSince(
+        since: string,
+        organizationId: string,
+        repositoryIds: string[],
+    ): Promise<Array<{ id: string; name: string; username: string }>>;
+    hasStoredPullRequests(
+        organizationId: string,
+        repositoryIds: string[],
+    ): Promise<boolean>;
+    findPullRequestAuthorLabelsByIds(
+        organizationId: string,
+        userIds: string[],
+    ): Promise<Array<{ id: string; name: string; username: string }>>;
+    // Keys of open PRs, optionally only those with an unresolved delivered
+    // suggestion. `truncated` = more than `limit` exist; the keys are partial.
+    findOpenPullRequestKeys(
+        organizationId: string,
+        repositoryIds: string[] | undefined,
+        opts: { unresolvedOnly?: boolean; limit: number },
+    ): Promise<{
+        keys: Array<{ number: number; repositoryId: string }>;
+        truncated: boolean;
+    }>;
     // Distinct PR authors (by display name) for the Author search autocomplete.
     findDistinctAuthorsByRepositoryIds(
         organizationId: string,
@@ -169,6 +219,15 @@ export interface IPullRequestsRepository {
             unresolvedOnly?: boolean;
             openOnly?: boolean;
         },
+    ): Promise<number>;
+    /**
+     * Pull requests an author opened in the organization, counting no further
+     * than `limit`: callers that only tell 0, 1 and "more" apart stop there.
+     */
+    countByAuthor(
+        organizationId: string,
+        authorId: string,
+        limit: number,
     ): Promise<number>;
     findFileWithSuggestions(
         prnumber: number,
@@ -236,10 +295,64 @@ export interface IPullRequestsRepository {
         ruleId: string,
         organizationId: string,
     ): Promise<ISuggestion[]>;
+    /**
+     * Records that Kody requested changes, over these review comments. A
+     * second request on the same PR adds to the first.
+     */
+    recordKodyChangeRequest(
+        organizationId: string,
+        repositoryId: string,
+        prNumber: number,
+        request: KodyChangeRequestRecord,
+    ): Promise<boolean>;
+    /**
+     * Adds a summary comment to the request made at `requestedAt`; a record
+     * cleared or replaced since then is left alone.
+     */
+    addKodyChangeRequestSummary(
+        organizationId: string,
+        repositoryId: string,
+        prNumber: number,
+        requestedAt: string,
+        summaryCommentId: string,
+    ): Promise<boolean>;
+    /**
+     * Forgets the request read at `requestedAt`. One made since then stays:
+     * it is a different request, over findings the reader did not see.
+     */
+    clearKodyChangeRequest(
+        organizationId: string,
+        repositoryId: string,
+        prNumber: number,
+        requestedAt: string,
+    ): Promise<boolean>;
+    /** Whether the PR is open and still carries the request read at `requestedAt`. */
+    hasOpenKodyChangeRequest(
+        organizationId: string,
+        repositoryId: string,
+        prNumber: number,
+        requestedAt: string,
+    ): Promise<boolean>;
+    /** The open PRs of an organization that carry Kody's change request. */
+    findOpenPullRequestsWithKodyChangeRequest(
+        organizationId: string,
+    ): Promise<IPullRequestWithKodyChangeRequest[]>;
+    /** The stored state of the suggestions behind a change request. */
+    findKodyChangeRequestFindings(
+        organizationId: string,
+        repositoryId: string,
+        prNumber: number,
+        suggestionIds: string[],
+    ): Promise<KodyChangeRequestFinding[]>;
     findPullRequestsWithDeliveredSuggestions(
         organizationId: string,
         prNumbers: number[],
         status: string | string[],
+        /**
+         * The (repository, number) pairs, when the caller knows them: read in
+         * their place, one repository at a time.
+         */
+        pullRequestRefs?: Array<{ repositoryId: string; number: number }>,
     ): Promise<IPullRequestWithDeliveredSuggestions[]>;
     findPullRequestsWithoutDeliveredSuggestionsForApproval(
         organizationId: string,
@@ -294,6 +407,14 @@ export interface IPullRequestsRepository {
         totalDeleted: number;
         totalChanges: number;
     }>;
+    /**
+     * Sets the PR totals to the sum of its stored files, in one server-side
+     * update that writes only when they differ. True when it wrote.
+     */
+    refreshFileTotalsIfStale(
+        prUuid: string,
+        organizationId: string,
+    ): Promise<boolean>;
 
     /**
      * Server-side sum of the UTF-8 bytes embedded in `files[].patch` for one
@@ -342,6 +463,7 @@ export interface IPullRequestsRepository {
         suggestionId: string,
         updateData: Partial<ISuggestion>,
         organizationAndTeamData: OrganizationAndTeamData,
+        options?: UpdateSuggestionOptions,
     ): Promise<PullRequestsEntity | null>;
     updateSyncedSuggestionsFlag(
         pullRequestNumbers: number[],

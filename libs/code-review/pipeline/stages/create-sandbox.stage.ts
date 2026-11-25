@@ -7,11 +7,15 @@ import {
     ORGANIZATION_SERVICE_TOKEN,
 } from '@libs/organization/domain/organization/contracts/organization.service.contract';
 import type { SandboxInstance } from '@libs/sandbox/domain/contracts/sandbox.provider';
+import { findFixedEgressIpUnavailable } from '@libs/sandbox/domain/egress-plan';
 import {
     CustomAgentCliProvisioning,
     provisionCustomAgentClis,
 } from '@libs/code-review/infrastructure/agents/custom-agent-cli/custom-agent-cli.provisioner';
-import { ignoredFilesForCustomAgents } from '@libs/code-review/infrastructure/agents/custom-agents/custom-agent-scope';
+import {
+    ignoredFilesForCustomAgents,
+    selectCustomAgents,
+} from '@libs/code-review/infrastructure/agents/custom-agents/custom-agent-scope';
 
 import {
     ISandboxLeaseManager,
@@ -24,14 +28,17 @@ import { BasePipelineStage } from '@libs/core/infrastructure/pipeline/abstracts/
 import { StageVisibility } from '@libs/core/infrastructure/pipeline/enums/stage-visibility.enum';
 import { CodeReviewPipelineContext } from '../context/code-review-pipeline.context';
 import { CliReviewPipelineContext } from '@libs/cli-review/pipeline/context/cli-review-pipeline.context';
+import { ULTRA_RUN_LEASE_TTL_MS } from '@libs/ee/ultra-review/ultra-review.executor';
 
 /**
- * After review finishes, only keep the sandbox warm for 30 seconds. Either
- * `@kody` arrives in a hot window (likely seconds after the review comment
- * lands) — and benefits from warm-resume — or the user takes their time and
- * comes back well past the lease TTL anyway, where cold-start is unavoidable.
- * 30s strikes the balance without keeping a paused sandbox occupying an E2B
- * concurrent slot for the full default 5-min idle window.
+ * After the review's last read of the checkout, only keep the sandbox warm for
+ * 30 seconds. Either `@kody` arrives in a hot window (likely seconds after the
+ * review comment lands) — and benefits from warm-resume — or the user takes
+ * their time and comes back well past the lease TTL anyway, where cold-start
+ * is unavoidable.
+ * The sandbox keeps running, and billing, through the window, so 30s rather
+ * than the default 5 min. (A paused E2B sandbox bills no compute and holds no
+ * concurrent slot; this window is spent running, not paused.)
  */
 const REVIEW_IDLE_TIMEOUT_MS = 30_000;
 
@@ -156,10 +163,11 @@ export class CreateSandboxStage extends BasePipelineStage<CodeReviewPipelineCont
             // call (one retry, none on timeouts) and a circuit breaker that
             // fails fast while sandbox infra is degraded. If acquire() throws
             // here the review continues self-contained.
+            // An Ultra review's Kody Rules run as long as its models do.
             const { sandbox, leaseId } = await this.leaseManager.acquire(
                 prKey,
                 'review',
-                undefined,
+                context.ultra ? ULTRA_RUN_LEASE_TTL_MS : undefined,
                 {
                     cloneUrl: cloneInfo.url,
                     authToken: cloneInfo.authToken,
@@ -171,19 +179,29 @@ export class CreateSandboxStage extends BasePipelineStage<CodeReviewPipelineCont
                     checkoutSha: cloneInfo.checkoutSha,
                     unifiedDiff: cliContext?.cliRawDiff,
                     sandboxMetadata: { stage: 'review' },
+                    organizationId:
+                        context.organizationAndTeamData?.organizationId,
+                    teamId: context.organizationAndTeamData?.teamId,
                 },
                 // A review waits for capacity as long as its job lives
                 { signal: context.parentSignal },
             );
 
-            // Override cleanup so the observer's context.sandboxHandle.cleanup()
-            // releases the lease (pause) rather than killing the sandbox.
-            // 30s idle window — see REVIEW_IDLE_TIMEOUT_MS rationale.
-            sandbox.cleanup = async () => {
-                await this.leaseManager.release(leaseId, {
+            // Override cleanup so it releases the lease (pause) rather than
+            // killing the sandbox. 30s idle window — see
+            // REVIEW_IDLE_TIMEOUT_MS rationale. Releases once: AgentReviewStage
+            // releases after its last read of the checkout (#2628), an Ultra
+            // review after its last run, and the observer's call at pipeline
+            // end is the fallback for a review that never got there. Every
+            // call shares that one release and its outcome. A failed one is
+            // not retried: release() is not idempotent (the lease count is a
+            // plain decrement), so a retry could take a co-holder's count; the
+            // lease TTL reaper frees it.
+            let release: Promise<void> | undefined;
+            sandbox.cleanup = () =>
+                (release ??= this.leaseManager.release(leaseId, {
                     idleMs: REVIEW_IDLE_TIMEOUT_MS,
-                });
-            };
+                }));
 
             this.logger.log({
                 message: `Sandbox lease acquired for ${label} (type=${sandbox.type}, baseBranch=${sandbox.baseBranch || 'none'})`,
@@ -231,6 +249,9 @@ export class CreateSandboxStage extends BasePipelineStage<CodeReviewPipelineCont
                         checkoutSha: freshCloneInfo.checkoutSha,
                         unifiedDiff: cliContext?.cliRawDiff,
                         sandboxMetadata: { stage: 'agent-review-renewed' },
+                        organizationId:
+                            context.organizationAndTeamData?.organizationId,
+                        teamId: context.organizationAndTeamData?.teamId,
                     };
                 };
             });
@@ -297,6 +318,26 @@ export class CreateSandboxStage extends BasePipelineStage<CodeReviewPipelineCont
                     });
                 });
             }
+            // The team's Git host refused Kodus's shared network and the team
+            // cannot use the fixed IP (plan or its own switch): theirs to act
+            // on, not an outage. The review says why it has no checkout.
+            const egressBlocked = findFixedEgressIpUnavailable(err);
+            if (egressBlocked) {
+                this.logger.warn({
+                    message: `No sandbox for ${label}: the Git host refused Kodus's shared network (${egressBlocked.reason}, ${egressBlocked.blockedBy}), continuing without it`,
+                    context: this.stageName,
+                    metadata: {
+                        organizationAndTeamData:
+                            context?.organizationAndTeamData,
+                        prNumber: context?.pullRequest?.number,
+                        reason: egressBlocked.reason,
+                        blockedBy: egressBlocked.blockedBy,
+                    },
+                });
+                return this.updateContext(context, (draft) => {
+                    draft.sandboxUnavailableDetail = egressBlocked.message;
+                });
+            }
             this.logger.error({
                 message: `Failed to acquire sandbox lease for ${label} (all retries exhausted), continuing without it`,
                 context: this.stageName,
@@ -321,7 +362,11 @@ export class CreateSandboxStage extends BasePipelineStage<CodeReviewPipelineCont
         sandbox: SandboxInstance,
         skipReason?: string,
     ): Promise<CustomAgentCliProvisioning | undefined> {
-        const agents = context.codeReviewConfig?.customAgents ?? [];
+        const agents = selectCustomAgents(
+            context.codeReviewConfig?.customAgents,
+            context.onlyCustomAgent,
+            context.riskAssessment,
+        );
         if (
             !agents.some(
                 (agent) =>
@@ -346,6 +391,7 @@ export class CreateSandboxStage extends BasePipelineStage<CodeReviewPipelineCont
                 sandbox,
                 agents,
                 onlyCustomAgent: context.onlyCustomAgent,
+                riskAssessment: context.riskAssessment,
                 skipReason,
                 changedFiles: (context.changedFiles ?? [])
                     .map((file) => file?.filename)

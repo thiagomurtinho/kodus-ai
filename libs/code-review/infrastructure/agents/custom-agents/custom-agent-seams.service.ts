@@ -641,6 +641,8 @@ export class CustomAgentTryRunnerService implements ICustomAgentTryRunner {
                 organizationAndTeamData,
                 repository,
                 prNumber,
+                headSha: pr.head?.sha,
+                baseSha: pr.base?.sha,
             })) ?? []) as Array<{ filename: string; patch?: string }>;
         const changedFiles = files.map((file) => ({
             ...file,
@@ -737,6 +739,7 @@ export class CustomAgentTryRunnerService implements ICustomAgentTryRunner {
                 warnings.push(
                     buildSandboxUnavailableWarning({
                         modelName: agent.models?.run || 'unknown',
+                        cause: context.sandboxUnavailableDetail,
                     }),
                 );
             }
