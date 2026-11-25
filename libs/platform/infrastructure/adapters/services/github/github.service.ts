@@ -16,7 +16,7 @@ import { ConfigService } from '@nestjs/config';
 import { createAppAuth } from '@octokit/auth-app';
 import { INTEGRATION_REQUEST_TIMEOUT_MS } from '@libs/core/infrastructure/http/integration-timeouts';
 import { runWithBoundedTimeout } from '@libs/core/workflow/infrastructure/run-with-bounded-timeout';
-import { graphql } from '@octokit/graphql';
+import { graphql, GraphqlResponseError } from '@octokit/graphql';
 import { enterpriseServer313 } from '@octokit/plugin-enterprise-server';
 import { retry } from '@octokit/plugin-retry';
 import { groupCommentsByPullRequest } from './github-comment-sample';
@@ -3766,107 +3766,130 @@ export class GithubService
      * The issues GitHub ties to a pull request: the ones linked in its
      * Development sidebar or by a closing keyword (`closingIssuesReferences`),
      * and the issues of the same repository that mention it (a cross-reference
-     * event whose source is an issue). Never throws: a failure, or a missing
-     * permission, answers with none.
+     * event whose source is an issue). The two are read by separate queries,
+     * so a failure of one never removes what the other found, and a response
+     * that carries both data and errors (a node the app may not read) keeps
+     * its data. Never throws: what could not be read is left out.
      */
     async getPullRequestLinkedIssues(
         params: GetPullRequestLinkedIssuesParams,
     ): Promise<PullRequestLinkedIssues> {
         const { organizationAndTeamData, repository, prNumber } = params;
-        const none: PullRequestLinkedIssues = {
-            closing: [],
-            crossReferencing: [],
+        const own = `${repository.owner}/${repository.name}`.toLowerCase();
+        const variables = {
+            owner: repository.owner,
+            name: repository.name,
+            number: prNumber,
         };
-        const query = `
-            query ($owner: String!, $name: String!, $number: Int!) {
-                repository(owner: $owner, name: $name) {
-                    pullRequest(number: $number) {
-                        closingIssuesReferences(first: 10) {
-                            nodes { number repository { nameWithOwner } }
+        const warn = (what: string, error: unknown) =>
+            this.logger.warn({
+                message: `Could not read the ${what} of a pull request`,
+                context: GithubService.name,
+                error: error as Error,
+                metadata: {
+                    organizationId: organizationAndTeamData?.organizationId,
+                    repository: own,
+                    prNumber,
+                },
+            });
+        let graphqlClient: typeof graphql | undefined;
+        const pullRequestOf = async (
+            what: string,
+            query: string,
+        ): Promise<any> => {
+            try {
+                graphqlClient ??= await this.instanceGraphQL(
+                    organizationAndTeamData,
+                );
+                const response: any = await graphqlClient(query, variables);
+                return response?.repository?.pullRequest;
+            } catch (error) {
+                // Partial data (some nodes unreadable) is still data.
+                if (error instanceof GraphqlResponseError) {
+                    warn(what, error);
+                    return (error.data as any)?.repository?.pullRequest;
+                }
+                warn(what, error);
+                return undefined;
+            }
+        };
+        const refOf = (node: any): LinkedIssueRef | undefined => {
+            const number = node?.number;
+            if (!Number.isInteger(number) || number < 1) {
+                return undefined;
+            }
+            const full = node?.repository?.nameWithOwner as string | undefined;
+            if (!full || full.toLowerCase() === own) {
+                return { number };
+            }
+            const [owner, name] = full.split('/');
+            return owner && name
+                ? { number, repository: { owner, name } }
+                : undefined;
+        };
+        const unique = (refs: Array<LinkedIssueRef | undefined>) => {
+            const seen = new Set<string>();
+            return refs.filter((r): r is LinkedIssueRef => {
+                const key = `${r?.repository?.owner ?? ''}/${r?.repository?.name ?? ''}#${r?.number}`;
+                if (!r || seen.has(key)) {
+                    return false;
+                }
+                seen.add(key);
+                return true;
+            });
+        };
+
+        const [closing, timeline] = await Promise.all([
+            pullRequestOf(
+                'linked issues',
+                `query ($owner: String!, $name: String!, $number: Int!) {
+                    repository(owner: $owner, name: $name) {
+                        pullRequest(number: $number) {
+                            closingIssuesReferences(first: 10) {
+                                nodes { number repository { nameWithOwner } }
+                            }
                         }
-                        timelineItems(first: 50, itemTypes: [CROSS_REFERENCED_EVENT]) {
-                            nodes {
-                                ... on CrossReferencedEvent {
-                                    isCrossRepository
-                                    source {
-                                        __typename
-                                        ... on Issue { number repository { nameWithOwner } }
+                    }
+                }`,
+            ),
+            pullRequestOf(
+                'cross-references',
+                `query ($owner: String!, $name: String!, $number: Int!) {
+                    repository(owner: $owner, name: $name) {
+                        pullRequest(number: $number) {
+                            timelineItems(first: 50, itemTypes: [CROSS_REFERENCED_EVENT]) {
+                                nodes {
+                                    ... on CrossReferencedEvent {
+                                        isCrossRepository
+                                        source {
+                                            __typename
+                                            ... on Issue { number repository { nameWithOwner } }
+                                        }
                                     }
                                 }
                             }
                         }
                     }
-                }
-            }
-        `;
-        try {
-            const graphql = await this.instanceGraphQL(organizationAndTeamData);
-            const response: any = await graphql(query, {
-                owner: repository.owner,
-                name: repository.name,
-                number: prNumber,
-            });
-            const pullRequest = response?.repository?.pullRequest;
-            const own = `${repository.owner}/${repository.name}`.toLowerCase();
-            const refOf = (node: any): LinkedIssueRef | undefined => {
-                const number = node?.number;
-                if (!Number.isInteger(number) || number < 1) {
-                    return undefined;
-                }
-                const full = node?.repository?.nameWithOwner as
-                    string | undefined;
-                if (!full || full.toLowerCase() === own) {
-                    return { number };
-                }
-                const [owner, name] = full.split('/');
-                return owner && name
-                    ? { number, repository: { owner, name } }
-                    : undefined;
-            };
-            const unique = (refs: Array<LinkedIssueRef | undefined>) => {
-                const seen = new Set<string>();
-                return refs.filter((r): r is LinkedIssueRef => {
-                    const key = `${r?.repository?.owner ?? ''}/${r?.repository?.name ?? ''}#${r?.number}`;
-                    if (!r || seen.has(key)) {
-                        return false;
-                    }
-                    seen.add(key);
-                    return true;
-                });
-            };
-            return {
-                closing: unique(
-                    (pullRequest?.closingIssuesReferences?.nodes ?? []).map(
-                        refOf,
+                }`,
+            ),
+        ]);
+        return {
+            closing: unique(
+                (closing?.closingIssuesReferences?.nodes ?? []).map(refOf),
+            ),
+            crossReferencing: unique(
+                (timeline?.timelineItems?.nodes ?? [])
+                    .filter(
+                        (event: any) =>
+                            event?.isCrossRepository === false &&
+                            event?.source?.__typename === 'Issue',
+                    )
+                    .map((event: any) => refOf(event.source))
+                    .filter(
+                        (ref: LinkedIssueRef | undefined) => !ref?.repository,
                     ),
-                ),
-                crossReferencing: unique(
-                    (pullRequest?.timelineItems?.nodes ?? [])
-                        .filter(
-                            (event: any) =>
-                                event?.isCrossRepository === false &&
-                                event?.source?.__typename === 'Issue',
-                        )
-                        .map((event: any) => refOf(event.source))
-                        .filter(
-                            (ref: LinkedIssueRef | undefined) =>
-                                !ref?.repository,
-                        ),
-                ),
-            };
-        } catch (error) {
-            this.logger.warn({
-                message: 'Could not read the issues linked to a pull request',
-                context: GithubService.name,
-                error,
-                metadata: {
-                    organizationId: organizationAndTeamData?.organizationId,
-                    repository: `${repository.owner}/${repository.name}`,
-                    prNumber,
-                },
-            });
-            return none;
-        }
+            ),
+        };
     }
 
     /**

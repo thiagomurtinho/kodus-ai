@@ -1,3 +1,5 @@
+import { GraphqlResponseError } from '@octokit/graphql';
+
 import { GithubService } from './github.service';
 
 jest.mock('@libs/mcp-server/services/mcp-manager.service', () => ({
@@ -112,5 +114,91 @@ describe('GithubService.getPullRequestLinkedIssues', () => {
             closing: [],
             crossReferencing: [],
         });
+    });
+
+    const responseError = (data: unknown) =>
+        new GraphqlResponseError({ query: '', variables: {} } as any, {}, {
+            data,
+            errors: [
+                {
+                    type: 'FORBIDDEN',
+                    message: 'Resource not accessible by integration',
+                },
+            ],
+        } as any);
+
+    it('keeps the data of a response that also carries errors', async () => {
+        const { service } = serviceWith(() => {
+            throw responseError({
+                repository: {
+                    pullRequest: {
+                        closingIssuesReferences: {
+                            nodes: [
+                                {
+                                    number: 7,
+                                    repository: { nameWithOwner: 'acme/web' },
+                                },
+                                null,
+                            ],
+                        },
+                    },
+                },
+            });
+        });
+        const result = await service.getPullRequestLinkedIssues(params);
+        expect(result.closing).toEqual([{ number: 7 }]);
+    });
+
+    it('keeps the closing links when the cross-reference query fails outright', async () => {
+        const graphql = jest.fn(async (query: string) => {
+            if (query.includes('timelineItems')) {
+                throw new Error('502 Bad Gateway');
+            }
+            return pullRequest({
+                closingIssuesReferences: {
+                    nodes: [
+                        {
+                            number: 7,
+                            repository: { nameWithOwner: 'acme/web' },
+                        },
+                    ],
+                },
+            });
+        });
+        const service = Object.create(GithubService.prototype) as GithubService;
+        (service as any).instanceGraphQL = async () => graphql;
+        (service as any).logger = { warn: jest.fn() };
+        await expect(
+            service.getPullRequestLinkedIssues(params),
+        ).resolves.toEqual({ closing: [{ number: 7 }], crossReferencing: [] });
+        expect(graphql).toHaveBeenCalledTimes(2);
+    });
+
+    it('keeps the cross-references when the closing-links query fails outright', async () => {
+        const graphql = jest.fn(async (query: string) => {
+            if (query.includes('closingIssuesReferences')) {
+                throw new Error('502 Bad Gateway');
+            }
+            return pullRequest({
+                timelineItems: {
+                    nodes: [
+                        {
+                            isCrossRepository: false,
+                            source: {
+                                __typename: 'Issue',
+                                number: 8,
+                                repository: { nameWithOwner: 'acme/web' },
+                            },
+                        },
+                    ],
+                },
+            });
+        });
+        const service = Object.create(GithubService.prototype) as GithubService;
+        (service as any).instanceGraphQL = async () => graphql;
+        (service as any).logger = { warn: jest.fn() };
+        await expect(
+            service.getPullRequestLinkedIssues(params),
+        ).resolves.toEqual({ closing: [], crossReferencing: [{ number: 8 }] });
     });
 });
