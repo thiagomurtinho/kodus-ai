@@ -371,3 +371,82 @@ describe('Business Logic reference resolution: what keeps working', () => {
         expect(found).toEqual({ kind: 'found', ids: ['PAY-42'] });
     });
 });
+
+describe('Business Logic reference resolution: several native links and key branches', () => {
+    it('judges every readable issue GitHub links to the PR, like several stated references', async () => {
+        const { tracker, reads } = gitIssues(titles);
+        const found = await resolved(
+            setup([tracker]),
+            request(
+                {
+                    title: 'Add the profile',
+                    body: 'Adds the page.',
+                    headRef: 'feature/x',
+                },
+                {
+                    pullRequestLinks: links([
+                        { number: 12 },
+                        { number: 14 },
+                        {
+                            number: 5,
+                            repository: { owner: 'other', name: 'private' },
+                        },
+                    ]),
+                },
+            ),
+        );
+        expect(found).toEqual({ kind: 'found', ids: ['#12', '#14'] });
+        expect(reads).toEqual(['12', '14', '5']);
+    });
+
+    it('takes more links than one validation covers as a release, not as a task', async () => {
+        const { tracker } = gitIssues(titles);
+        const found = await resolved(
+            setup([tracker]),
+            request(
+                { title: 'Release', body: 'Closes #77', headRef: 'feature/x' },
+                {
+                    pullRequestLinks: links([
+                        { number: 12 },
+                        { number: 14 },
+                        { number: 311 },
+                        { number: 341 },
+                    ]),
+                },
+            ),
+        );
+        expect(found.kind).toBe('too_many_references');
+    });
+
+    it('prefers the native link over a Jira key the branch carries', async () => {
+        const { tracker } = gitIssues(titles);
+        const found = await resolved(
+            setup([jira({ 'PAY-42': 'Refund flow' }), tracker]),
+            request(
+                {
+                    title: 'Add the Kodus profile',
+                    body: 'Adds the page.',
+                    headRef: 'feature/PAY-42-refunds',
+                },
+                { pullRequestLinks: links([{ number: 341 }]) },
+            ),
+        );
+        expect(found).toEqual({ kind: 'found', ids: ['#341'] });
+    });
+
+    it('falls back to the Jira key of the branch when no link or citation reads', async () => {
+        const { tracker } = gitIssues(titles);
+        const found = await resolved(
+            setup([jira({ 'PAY-42': 'Refund flow' }), tracker]),
+            request(
+                {
+                    title: 'Refunds',
+                    body: 'Closes #404',
+                    headRef: 'feature/PAY-42-refunds',
+                },
+                { pullRequestLinks: links([{ number: 500 }]) },
+            ),
+        );
+        expect(found).toEqual({ kind: 'found', ids: ['PAY-42'] });
+    });
+});

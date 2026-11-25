@@ -176,6 +176,49 @@ export function selectReferences(
     return chosen.length > max ? undefined : chosen;
 }
 
+/**
+ * The references of a PR in the order they are tried: what the command was
+ * given, then what the title and description state or cite, and last the
+ * branch, which is a hint (`work/341-profile`), never a statement. A key a
+ * branch carries (`WORK-341`) is therefore tried only after the description,
+ * so a team's branch convention can't hide the issue the description cites.
+ * Native links and cross-references sit between these steps; the caller adds
+ * them.
+ */
+export function splitReferenceSteps(references: TaskReference[]): {
+    command: TaskReference[];
+    text: TaskReference[];
+    branch: TaskReference[];
+} {
+    return {
+        command: references.filter((r) => r.source === 'command'),
+        text: references.filter(
+            (r) => r.source === 'title' || r.source === 'body',
+        ),
+        branch: references.filter((r) => r.source === 'branch'),
+    };
+}
+
+/**
+ * An issue GitHub itself ties to the PR, as a reference: explicit, so it
+ * counts as stated whatever the description says.
+ */
+export function linkedIssueReference(issue: {
+    number: number;
+    repository?: { owner: string; name: string };
+}): TaskReference {
+    return {
+        kind: 'git_issue',
+        id: String(issue.number),
+        raw: issue.repository
+            ? `${issue.repository.owner}/${issue.repository.name}#${issue.number}`
+            : `#${issue.number}`,
+        source: 'link',
+        intent: 'closes',
+        ...(issue.repository ? { repository: issue.repository } : {}),
+    };
+}
+
 /** The text right before a reference, on its own line. */
 function lineBefore(text: string, index: number): string {
     const window = text.slice(Math.max(0, index - 40), index);

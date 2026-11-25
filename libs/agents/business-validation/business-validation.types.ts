@@ -5,7 +5,7 @@ import type { ValidationResult } from './judge/validation.types';
 import type { BusinessLogicSettings } from './settings';
 
 /** Where in the request a task reference was written. Earlier wins. */
-export type ReferenceSource = 'command' | 'title' | 'branch' | 'body';
+export type ReferenceSource = 'command' | 'link' | 'title' | 'branch' | 'body';
 
 /**
  * What the PR says it does to the task. "Part of SAA-96" delivers a slice, so
@@ -190,7 +190,12 @@ export interface ResolutionAttempt {
 export type TaskResolution =
     | { kind: 'found'; tasks: FoundTask[]; attempts: ResolutionAttempt[] }
     /** The PR names no task. */
-    | { kind: 'no_reference'; attempts: ResolutionAttempt[] }
+    | {
+          kind: 'no_reference';
+          attempts: ResolutionAttempt[];
+          /** Issues that each mention the PR, none of them chosen: the author picks one. */
+          candidates?: string[];
+      }
     /** The PR states more tasks than one validation covers (a release, a merge). */
     | { kind: 'too_many_references'; attempts: ResolutionAttempt[] }
     /** No task tracker is connected for the organization. */
