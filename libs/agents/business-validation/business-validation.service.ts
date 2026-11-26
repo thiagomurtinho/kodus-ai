@@ -36,6 +36,7 @@ import type {
     BusinessValidationRequest,
     BusinessValidationResult,
     FoundTask,
+    LinkedIssue,
     ResolutionAttempt,
     Task,
     TaskCheck,
@@ -91,12 +92,19 @@ import {
     formatTaskForJudge,
     gradeTask,
 } from './task-quality';
-import { extractTaskReferences, referenceLabel } from './task-references';
+import {
+    extractTaskReferences,
+    linkedIssueReference,
+    referenceLabel,
+    distinctReferences,
+    splitReferenceSteps,
+} from './task-references';
 import { repositoryForLookup, resolveTasks } from './task-resolver';
 import { createAgentToolReader } from './trackers/agent-tool-reader';
 import { aiSdkAgentRun, createTaskFinder } from './trackers/task-finder';
 import { rankReadTools } from './trackers/custom-mcp.tracker';
 import { McpToolSession } from './trackers/mcp-tool-session';
+import type { TaskTracker, TrackerReadContext } from './trackers/tracker';
 import {
     buildTaskTrackers,
     isManagedTracker,
@@ -275,13 +283,14 @@ export class BusinessValidationService {
             },
             { taskIdPattern: settings.taskIdPattern },
         );
-        // A task named in the command is the one to check, whatever the PR says.
-        const fromCommand = references.filter((r) => r.source === 'command');
-        const wanted = fromCommand.length ? fromCommand : references;
+        const steps = splitReferenceSteps(references);
         const commandTask = inlineTask(request.taskInput, references);
         const judge = this.lazyJudge(request);
 
         let resolution: TaskResolution;
+        let wanted: TaskReference[] = steps.command.length
+            ? steps.command
+            : references;
         let trackerNames: string[] = [];
         if (commandTask) {
             resolution = {
@@ -289,7 +298,7 @@ export class BusinessValidationService {
                 tasks: [{ task: commandTask }],
                 attempts: [],
             };
-        } else if (!wanted.length) {
+        } else if (!references.length && !request.pullRequestLinks) {
             resolution = { kind: 'no_reference', attempts: [] };
         } else {
             const servers = await this.connections(
@@ -322,11 +331,27 @@ export class BusinessValidationService {
             });
             trackerNames = trackers.map((t) => t.name);
             try {
-                resolution = await resolveTasks(wanted, trackers, {
+                const lookup = {
                     organizationAndTeamData: request.organizationAndTeamData,
                     repository: this.repositoryOf(request),
                     signal: request.signal,
-                });
+                };
+                if (steps.command.length) {
+                    // A task named in the command is the one to check,
+                    // whatever the PR says.
+                    resolution = await resolveTasks(
+                        steps.command,
+                        trackers,
+                        lookup,
+                    );
+                } else {
+                    ({ resolution, wanted } = await this.resolveInOrder(
+                        request,
+                        steps,
+                        trackers,
+                        lookup,
+                    ));
+                }
             } finally {
                 await this.release(
                     trackers,
@@ -353,6 +378,156 @@ export class BusinessValidationService {
             attempts: resolution.attempts,
             trackers: trackerNames,
         };
+    }
+
+    /**
+     * Which task a PR is checked against, stopping at the first step that
+     * reads one: the issues GitHub links to the PR and what its title names,
+     * what the description states or cites, the one issue that mentions the
+     * PR, the branch (a hint; a key it carries never hides the steps before)
+     * and last what the description only mentions.
+     * When nothing reads, the most telling failure stands, and several
+     * issues that mention the PR are named for the author to choose from.
+     */
+    private async resolveInOrder(
+        request: BusinessValidationRequest,
+        steps: ReturnType<typeof splitReferenceSteps>,
+        trackers: TaskTracker[],
+        lookup: TrackerReadContext,
+    ): Promise<{ resolution: TaskResolution; wanted: TaskReference[] }> {
+        const failures: Array<{
+            resolution: TaskResolution;
+            wanted: TaskReference[];
+            /** The branch step: a hint, whose miss says nothing about the PR. */
+            hint: boolean;
+        }> = [];
+        const attempt = async (wanted: TaskReference[], hint = false) => {
+            if (!wanted.length) {
+                return undefined;
+            }
+            const resolution = await resolveTasks(wanted, trackers, lookup);
+            // More tasks than one validation covers is a release or a merge:
+            // no later step turns it into one task.
+            if (
+                resolution.kind === 'found' ||
+                resolution.kind === 'too_many_references'
+            ) {
+                return { resolution, wanted };
+            }
+            failures.push({ resolution, wanted, hint });
+            return undefined;
+        };
+        const links = request.pullRequestLinks;
+        const linked = async (
+            read: (() => Promise<LinkedIssue[]>) | undefined,
+        ): Promise<LinkedIssue[]> => {
+            try {
+                return (await read?.call(links)) ?? [];
+            } catch (error) {
+                this.logger.warn({
+                    message:
+                        'Business validation could not read the issues linked to the PR',
+                    context: BusinessValidationService.name,
+                    error,
+                    metadata: {
+                        organizationId:
+                            request.organizationAndTeamData.organizationId,
+                    },
+                });
+                return [];
+            }
+        };
+
+        // What GitHub links to the PR and what its title names are both
+        // explicit, and judged together (up to MAX_REFERENCES).
+        const native = await linked(links?.closingIssues);
+        const byLink = await attempt(
+            distinctReferences(
+                [...native.map(linkedIssueReference), ...steps.title],
+                lookup.repository,
+            ),
+        );
+        if (byLink) {
+            return byLink;
+        }
+        const byBody = await attempt(steps.body);
+        if (byBody) {
+            return byBody;
+        }
+        // Issues that mention the PR are asked for only when no link and
+        // nothing the author wrote read as a task, and used only when there
+        // is exactly one.
+        const mentioning = await linked(links?.crossReferencingIssues);
+        // A list the host cut short can't prove there is only one.
+        const truncated = mentioning.length
+            ? await Promise.resolve(links?.crossReferencingTruncated?.()).catch(
+                  () => false,
+              )
+            : false;
+        const byMention =
+            mentioning.length === 1 && !truncated
+                ? await attempt(mentioning.map(linkedIssueReference))
+                : undefined;
+        if (byMention) {
+            return byMention;
+        }
+        const byBranch = await attempt(steps.branch, true);
+        if (byBranch) {
+            return byBranch;
+        }
+        // Last: what the description only mentions (a follow-up, a related
+        // task), judged only when nothing else named a task.
+        const byMentions = await attempt(steps.mentions);
+        if (byMentions) {
+            return byMentions;
+        }
+
+        const attempts = failures.flatMap((f) => f.resolution.attempts);
+        // The author is asked to choose only when nothing else went wrong:
+        // a tracker that was down, or a release, keeps its own answer.
+        if (
+            (mentioning.length > 1 || (truncated && mentioning.length)) &&
+            // A branch hint that no tracker reads (`WORK-341`) doesn't count
+            // against it; a tracker that was down does.
+            failures.every(
+                (f) =>
+                    f.resolution.kind === 'no_reference' ||
+                    (f.hint && f.resolution.kind !== 'tracker_unavailable'),
+            )
+        ) {
+            return {
+                resolution: {
+                    kind: 'no_reference',
+                    attempts,
+                    candidates: mentioning.map((issue) =>
+                        referenceLabel(linkedIssueReference(issue)),
+                    ),
+                },
+                wanted: [],
+            };
+        }
+        const rank = (kind: TaskResolution['kind']) =>
+            [
+                'tracker_unavailable',
+                'too_many_references',
+                'not_found',
+                'no_capable_tracker',
+                'no_tracker',
+            ].indexOf(kind);
+        const chosen = [...failures].sort(
+            (a, b) =>
+                (rank(a.resolution.kind) + 1 || 99) -
+                (rank(b.resolution.kind) + 1 || 99),
+        )[0];
+        return chosen
+            ? {
+                  resolution: { ...chosen.resolution, attempts },
+                  wanted: chosen.wanted,
+              }
+            : {
+                  resolution: { kind: 'no_reference', attempts: [] },
+                  wanted: [],
+              };
     }
 
     private lazyJudge(
@@ -386,16 +561,30 @@ export class BusinessValidationService {
             message: this.answers(request) ? await translate(message) : message,
         });
 
+        const github = String(request.platformType).toUpperCase() === 'GITHUB';
         // A bot's PR (a dependency bump) has no task to name.
         const askForTask =
             settings.requireTask && !request.pullRequest?.authorIsBot;
         switch (resolution.kind) {
             case 'no_reference':
+                if (resolution.candidates?.length) {
+                    // Several issues mention the PR: none is picked for the author.
+                    const message = messages.ambiguousIssueMessage(
+                        resolution.candidates,
+                        github,
+                    );
+                    return askForTask
+                        ? {
+                              kind: 'task_required',
+                              message: await translate(message),
+                          }
+                        : skip('no_reference', message);
+                }
                 return askForTask
                     ? {
                           kind: 'task_required',
                           message: await translate(
-                              messages.taskRequiredMessage(),
+                              messages.taskRequiredMessage(github),
                           ),
                       }
                     : skip('no_reference', messages.noReferenceMessage());

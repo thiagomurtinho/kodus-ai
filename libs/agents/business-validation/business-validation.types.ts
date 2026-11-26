@@ -5,7 +5,7 @@ import type { ValidationResult } from './judge/validation.types';
 import type { BusinessLogicSettings } from './settings';
 
 /** Where in the request a task reference was written. Earlier wins. */
-export type ReferenceSource = 'command' | 'title' | 'branch' | 'body';
+export type ReferenceSource = 'command' | 'link' | 'title' | 'branch' | 'body';
 
 /**
  * What the PR says it does to the task. "Part of SAA-96" delivers a slice, so
@@ -190,7 +190,12 @@ export interface ResolutionAttempt {
 export type TaskResolution =
     | { kind: 'found'; tasks: FoundTask[]; attempts: ResolutionAttempt[] }
     /** The PR names no task. */
-    | { kind: 'no_reference'; attempts: ResolutionAttempt[] }
+    | {
+          kind: 'no_reference';
+          attempts: ResolutionAttempt[];
+          /** Issues that each mention the PR, none of them chosen: the author picks one. */
+          candidates?: string[];
+      }
     /** The PR states more tasks than one validation covers (a release, a merge). */
     | { kind: 'too_many_references'; attempts: ResolutionAttempt[] }
     /** No task tracker is connected for the organization. */
@@ -219,6 +224,12 @@ export type TaskResolution =
 /** Which entry point asked for the validation. */
 export type ValidationDoor = 'auto' | 'force' | 'command' | 'cli';
 
+/** An issue named by number; `repository` when it is not the PR's own. */
+export interface LinkedIssue {
+    number: number;
+    repository?: { owner: string; name: string };
+}
+
 export interface BusinessValidationRequest {
     door: ValidationDoor;
     organizationAndTeamData: OrganizationAndTeamData;
@@ -238,6 +249,18 @@ export interface BusinessValidationRequest {
         authorIsBot?: boolean;
     };
     platformType?: string;
+    /**
+     * Lazy lookups of the issues the host ties to the PR: the ones linked in
+     * its Development sidebar or by a closing keyword, and the issues of the
+     * repository that mention it. Each is called only when a resolution step
+     * needs it. Absent where the host has no such links (the CLI's local diff).
+     */
+    pullRequestLinks?: {
+        closingIssues(): Promise<LinkedIssue[]>;
+        crossReferencingIssues(): Promise<LinkedIssue[]>;
+        /** The host listed only part of the mentions: none may be picked alone. */
+        crossReferencingTruncated?(): Promise<boolean>;
+    };
     /**
      * The repository at the PR head, read-only, so a requirement the diff
      * doesn't show can be looked for in the code that already exists. Absent

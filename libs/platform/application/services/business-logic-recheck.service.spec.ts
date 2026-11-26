@@ -85,6 +85,7 @@ describe('BusinessLogicRecheckService', () => {
                     state: 'open',
                     title: 'feat(SAA-96)',
                     head: { ref: 'feat/saa-96', sha: 'abc1234' },
+                    base: { repo: { fullName: 'acme/notes' } },
                 })),
             };
             return {
@@ -96,6 +97,7 @@ describe('BusinessLogicRecheckService', () => {
                 ),
                 validation,
                 publisher,
+                code,
             };
         };
 
@@ -120,6 +122,39 @@ describe('BusinessLogicRecheckService', () => {
                 expect.objectContaining({
                     trigger: 'recheck',
                     pendingSince: firstSkip,
+                }),
+            );
+        });
+
+        it("names the repository's owner, so #N and the host's links to the PR resolve on a recheck", async () => {
+            const { service, validation } = build();
+
+            await service.recheckPending();
+
+            expect(validation.validate).toHaveBeenCalledWith(
+                expect.objectContaining({
+                    repository: {
+                        id: 'repo-1',
+                        name: 'notes',
+                        owner: 'acme',
+                        fullName: 'acme/notes',
+                    },
+                }),
+            );
+        });
+
+        it('keeps the repository as stored when the PR names no base repository', async () => {
+            const { service, validation, code } = build();
+            code.getPullRequest.mockResolvedValue({
+                state: 'open',
+                head: { ref: 'x' },
+            } as any);
+
+            await service.recheckPending();
+
+            expect(validation.validate).toHaveBeenCalledWith(
+                expect.objectContaining({
+                    repository: { id: 'repo-1', name: 'notes' },
                 }),
             );
         });
