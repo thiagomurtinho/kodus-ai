@@ -96,6 +96,7 @@ import {
     extractTaskReferences,
     linkedIssueReference,
     referenceLabel,
+    distinctReferences,
     splitReferenceSteps,
 } from './task-references';
 import { repositoryForLookup, resolveTasks } from './task-resolver';
@@ -397,8 +398,10 @@ export class BusinessValidationService {
         const failures: Array<{
             resolution: TaskResolution;
             wanted: TaskReference[];
+            /** The branch step: a hint, whose miss says nothing about the PR. */
+            hint: boolean;
         }> = [];
-        const attempt = async (wanted: TaskReference[]) => {
+        const attempt = async (wanted: TaskReference[], hint = false) => {
             if (!wanted.length) {
                 return undefined;
             }
@@ -411,7 +414,7 @@ export class BusinessValidationService {
             ) {
                 return { resolution, wanted };
             }
-            failures.push({ resolution, wanted });
+            failures.push({ resolution, wanted, hint });
             return undefined;
         };
         const links = request.pullRequestLinks;
@@ -438,10 +441,12 @@ export class BusinessValidationService {
         // What GitHub links to the PR and what its title names are both
         // explicit, and judged together (up to MAX_REFERENCES).
         const native = await linked(links?.closingIssues);
-        const byLink = await attempt([
-            ...native.map(linkedIssueReference),
-            ...steps.title,
-        ]);
+        const byLink = await attempt(
+            distinctReferences(
+                [...native.map(linkedIssueReference), ...steps.title],
+                lookup.repository,
+            ),
+        );
         if (byLink) {
             return byLink;
         }
@@ -466,7 +471,7 @@ export class BusinessValidationService {
         if (byMention) {
             return byMention;
         }
-        const byBranch = await attempt(steps.branch);
+        const byBranch = await attempt(steps.branch, true);
         if (byBranch) {
             return byBranch;
         }
@@ -482,7 +487,13 @@ export class BusinessValidationService {
         // a tracker that was down, or a release, keeps its own answer.
         if (
             (mentioning.length > 1 || (truncated && mentioning.length)) &&
-            failures.every((f) => f.resolution.kind === 'no_reference')
+            // A branch hint that no tracker reads (`WORK-341`) doesn't count
+            // against it; a tracker that was down does.
+            failures.every(
+                (f) =>
+                    f.resolution.kind === 'no_reference' ||
+                    (f.hint && f.resolution.kind !== 'tracker_unavailable'),
+            )
         ) {
             return {
                 resolution: {

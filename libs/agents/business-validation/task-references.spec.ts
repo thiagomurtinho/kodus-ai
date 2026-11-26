@@ -1,6 +1,7 @@
 import {
     extractTaskReferences,
     referenceLabel,
+    distinctReferences,
     linkedIssueReference,
     selectReferences,
     splitReferenceSteps,
@@ -571,5 +572,35 @@ describe('linkedIssueReference', () => {
             raw: 'acme/specs#3',
             repository: { owner: 'acme', name: 'specs' },
         });
+    });
+});
+
+describe('distinctReferences', () => {
+    const own = { owner: 'org', name: 'repo' };
+    const refs = (text: string) => extractTaskReferences({ title: text });
+
+    it('keeps the first of an issue named twice', () => {
+        const linked = linkedIssueReference({ number: 12 });
+        const [title] = refs('Fix #12');
+        expect(distinctReferences([linked, title], own)).toEqual([linked]);
+    });
+
+    it("reads `#12` and `org/repo#12` of the repository's own as one", () => {
+        const all = [...refs('Fix #12'), ...refs('Fix ORG/Repo#12')];
+        expect(distinctReferences(all, own)).toHaveLength(1);
+    });
+
+    it('keeps an issue of another repository, and keys of different tasks', () => {
+        const all = [
+            ...refs('Fix #12'),
+            ...refs('Fix acme/specs#12'),
+            ...refs('PAY-1 and PAY-2'),
+        ];
+        expect(distinctReferences(all, own).map((r) => r.id)).toEqual([
+            '12',
+            '12',
+            'PAY-1',
+            'PAY-2',
+        ]);
     });
 });

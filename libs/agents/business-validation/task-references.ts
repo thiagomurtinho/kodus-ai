@@ -574,3 +574,31 @@ function fromUrl(url: string, source: ReferenceSource): Candidate | undefined {
 function trimUrl(url: string): string {
     return url.replace(/[.,;:!?]+$/, '');
 }
+
+/**
+ * The references once each: an issue a title cites and GitHub links to the PR
+ * is one task, and `#12` equals `owner/repo#12` of the PR's own repository.
+ * The first occurrence stays, so a native link keeps its place.
+ */
+export function distinctReferences(
+    references: TaskReference[],
+    repository?: { owner?: string; name: string },
+): TaskReference[] {
+    const own =
+        `${repository?.owner ?? ''}/${repository?.name ?? ''}`.toLowerCase();
+    const seen = new Set<string>();
+    return references.filter((reference) => {
+        const where =
+            reference.kind === 'git_issue'
+                ? reference.repository
+                    ? `${reference.repository.owner}/${reference.repository.name}`.toLowerCase()
+                    : own
+                : '';
+        const key = `${reference.kind}:${reference.id.toLowerCase()}:${where}`;
+        if (seen.has(key)) {
+            return false;
+        }
+        seen.add(key);
+        return true;
+    });
+}

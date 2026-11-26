@@ -715,3 +715,121 @@ describe('Business Logic reference resolution: what the message says', () => {
         expect(translate).toHaveBeenCalledTimes(1);
     });
 });
+
+describe('Business Logic reference resolution: an issue named twice', () => {
+    it('reads each issue once when the title cites the issues GitHub links', async () => {
+        const { tracker, reads } = gitIssues(titles);
+        const found = await resolved(
+            setup([tracker]),
+            request(
+                {
+                    title: 'Fix #12 and #14',
+                    body: 'Adds the page.',
+                    headRef: 'feature/x',
+                },
+                { pullRequestLinks: links([{ number: 12 }, { number: 14 }]) },
+            ),
+        );
+        expect(found).toEqual({ kind: 'found', ids: ['#12', '#14'] });
+        expect(reads).toEqual(['12', '14']);
+    });
+
+    it('reads the issue once when the title cites the one GitHub links', async () => {
+        const { tracker, reads } = gitIssues(titles);
+        const found = await resolved(
+            setup([tracker]),
+            request(
+                {
+                    title: 'Fix #12',
+                    body: 'Adds the page.',
+                    headRef: 'feature/x',
+                },
+                { pullRequestLinks: links([{ number: 12 }]) },
+            ),
+        );
+        expect(found).toEqual({ kind: 'found', ids: ['#12'] });
+        expect(reads).toEqual(['12']);
+    });
+
+    it("counts `#12` and `org/repo#12` of the PR's own repository as one issue", async () => {
+        const { tracker, reads } = gitIssues(titles);
+        const found = await resolved(
+            setup([tracker]),
+            request(
+                {
+                    title: 'Fix org/repo#12',
+                    body: 'Adds the page.',
+                    headRef: 'feature/x',
+                },
+                { pullRequestLinks: links([{ number: 12 }]) },
+            ),
+        );
+        expect(found).toEqual({ kind: 'found', ids: ['#12'] });
+        expect(reads).toEqual(['12']);
+    });
+});
+
+describe('Business Logic reference resolution: a branch hint nothing reads', () => {
+    it('still lists the candidates when the branch carries a key no tracker reads', async () => {
+        const { tracker, reads } = gitIssues(titles);
+        const outcome = await told(
+            setup([tracker]),
+            request(
+                {
+                    title: 'Add the profile',
+                    body: 'Adds the page.',
+                    headRef: 'work-341/x',
+                },
+                {
+                    pullRequestLinks: links(
+                        [],
+                        [{ number: 12 }, { number: 14 }],
+                    ),
+                },
+            ),
+        );
+        expect(reads).toEqual([]);
+        expect(outcome.kind).toBe('task_required');
+        expect(outcome.message).toContain('#12');
+        expect(outcome.message).toContain('#14');
+    });
+
+    it('keeps a tracker failure decisive even when the branch hint also missed', async () => {
+        const down = {
+            name: 'Git Issues',
+            canRead: (reference: TaskReference) =>
+                reference.kind === 'git_issue',
+            read: async () => ({
+                status: 'error' as const,
+                message: 'Git Issues failed',
+                tools: [],
+            }),
+            close: async () => undefined,
+        };
+        const service = setup([down]);
+        jest.spyOn(service as any, 'notifySourceUnavailable').mockResolvedValue(
+            undefined,
+        );
+        const decide = jest
+            .spyOn(service as any, 'decide')
+            .mockResolvedValue({ kind: 'skipped', reason: 'x', message: '' });
+        await (service as any).run(
+            request(
+                {
+                    title: 'Add the profile',
+                    body: 'Closes #77',
+                    headRef: 'work-341/x',
+                },
+                {
+                    pullRequestLinks: links(
+                        [],
+                        [{ number: 12 }, { number: 14 }],
+                    ),
+                },
+            ),
+        );
+        expect(decide.mock.calls[0][2]).toMatchObject({
+            kind: 'tracker_unavailable',
+        });
+    });
+});
