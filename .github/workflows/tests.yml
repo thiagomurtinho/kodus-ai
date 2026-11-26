@@ -138,7 +138,6 @@ jobs:
                   EOF
 
             - name: Enable pgvector extension
-              if: github.event.pull_request.head.repo.fork == false
               run: |
                   source .env
                   docker exec -e PGPASSWORD="$API_PG_DB_PASSWORD" postgres \
@@ -146,7 +145,6 @@ jobs:
                     -c "CREATE EXTENSION IF NOT EXISTS vector;"
 
             - name: Run migrations
-              if: github.event.pull_request.head.repo.fork == false
               # Mongo lives on the docker network (db_mongodb), unreachable from
               # this host step — skip the Mongo migrations here (their modules are
               # covered by mongo-migrations.integration.spec). Postgres migrations
